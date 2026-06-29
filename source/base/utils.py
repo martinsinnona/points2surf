@@ -225,3 +225,16 @@ def get_point_cloud_sub_sample(sub_sample_size, pts_ms, query_point_ms, rng, uni
         zeros_padding = np.zeros((sub_sample_size - pts_ms.shape[0], 3), dtype=np.float32)
         pts_sub_sample_ms = np.concatenate((pts_shuffled, zeros_padding), axis=0)
     return pts_sub_sample_ms
+
+
+def torch_load(path, map_location=None):
+    """Load checkpoints; PyTorch >= 2.6 defaults weights_only=True which breaks params pickles."""
+    import torch
+
+    kwargs = {}
+    if map_location is not None:
+        kwargs['map_location'] = map_location
+    try:
+        return torch.load(path, weights_only=False, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)

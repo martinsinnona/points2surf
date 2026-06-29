@@ -4,6 +4,7 @@ import numpy as np
 import trimesh
 
 from source.base import utils
+from source.base.point_cloud import kdtree_query, kdtree_query_ball_point
 
 
 def make_sample_points_for_3d_grid_unit_cube(grid_resolution):
@@ -34,12 +35,12 @@ def get_voxel_centers_grid(pts, grid_resolution, k, distance_threshold_ms=None, 
     # try to keep at least one voxel inside the surface and one outside
     if distance_threshold_ms is None:
         distance_threshold_ms = 1.0 / grid_resolution * 4.0  # larger to prevent holes in the volume
-    grid_pts_neighbor_ids = kdtree.query_ball_point(grid_pts_ms, distance_threshold_ms, n_jobs=num_processes)
+    grid_pts_neighbor_ids = kdtree_query_ball_point(kdtree, grid_pts_ms, distance_threshold_ms, workers=num_processes)
     grid_pts_has_close_neighbor = np.array([bool(len(ids_list)) for ids_list in grid_pts_neighbor_ids])
     grid_pts_near_surf_ms = grid_pts_ms[grid_pts_has_close_neighbor]
 
     # get patch points
-    patch_pts_dists, patch_pts_ids = kdtree.query(grid_pts_near_surf_ms, k, n_jobs=num_processes)
+    patch_pts_dists, patch_pts_ids = kdtree_query(kdtree, grid_pts_near_surf_ms, k=k, workers=num_processes)
     return grid_pts_near_surf_ms, patch_pts_dists, patch_pts_ids
 
 
@@ -72,7 +73,7 @@ def get_voxel_centers_grid_smaller_pc(pts, grid_resolution, distance_threshold_v
 
 def model_space_to_volume_space(pts_ms, vol_res):
     pts_pos_octant = (pts_ms + 1.0) / 2.0
-    return np.floor(pts_pos_octant * vol_res).astype(np.int)
+    return np.floor(pts_pos_octant * vol_res).astype(np.int32)
 
 
 def volume_space_to_model_space(pts_vs, vol_res):
@@ -178,6 +179,14 @@ def propagate_sign(vol, sigma=5, certainty_threshold=13):
     return vol
 
 
+def marching_cubes_compat(volume, level=0):
+    """skimage >= 0.19 removed marching_cubes_lewiner; use marching_cubes instead."""
+    from skimage import measure
+    if hasattr(measure, 'marching_cubes'):
+        return measure.marching_cubes(volume, level=level)
+    return measure.marching_cubes_lewiner(volume, level)
+
+
 def implicit_surface_to_mesh(query_dist_ms, query_pts_ms,
                              volume_out_file, mc_out_file, grid_res, sigma, certainty_threshold=26):
 
@@ -210,11 +219,10 @@ def implicit_surface_to_mesh(query_dist_ms, query_pts_ms,
 
     if volume.min() < 0.0 and volume.max() > 0.0:
         # reconstruct mesh from volume using marching cubes
-        from skimage import measure
         start = time.time()
-        v, f, normals, values = measure.marching_cubes_lewiner(volume, 0)
+        v, f, normals, values = marching_cubes_compat(volume, level=0)
         end = time.time()
-        print('Marching Cubes Lewiner took: {}'.format(end - start))
+        print('Marching cubes took: {}'.format(end - start))
 
         if v.size == 0 and f.size == 0:
             print('Warning: marching cubes gives no result!')
@@ -315,10 +323,24 @@ def get_query_pts_for_mesh(in_mesh: trimesh.Trimesh, num_query_pts: int, patch_r
     return query_pts
 
 
+def ensure_rtree():
+    """trimesh.proximity.signed_distance needs the rtree package (see requirements.txt)."""
+    try:
+        import rtree  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            'trimesh signed_distance requires rtree. Install with:\n'
+            '  pip install rtree\n'
+            '  conda install -c conda-forge rtree libspatialindex'
+        ) from e
+
+
 def get_signed_distance(in_mesh: trimesh.Trimesh, query_pts_ms,
                         signed_distance_batch_size=1000):
 
     import trimesh.proximity
+
+    ensure_rtree()
 
     # process batches because trimesh's signed_distance very inefficient on memory
     # 3k queries on a mesh with 27k vertices and 55k faces takes around 8 GB of RAM

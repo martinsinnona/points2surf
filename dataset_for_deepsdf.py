@@ -17,7 +17,7 @@ def _convert_pc(in_pc, out_pc):
     pc = None
     try:
         pc = np.load(in_pc)
-        pc = pc.astype(np.float)
+        pc = pc.astype(np.float32)
     except AttributeError as e:
         print(e)
     except IndexError as e:

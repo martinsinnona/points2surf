@@ -21,6 +21,7 @@ from source.points_to_surf_model import PointsToSurfModel
 from source import data_loader
 from source import sdf_nn
 from source.base import evaluation
+from source.base.utils import torch_load
 
 debug = False
 
@@ -269,7 +270,7 @@ def points_to_surf_train(opt):
         print(f'Refining weights from {opt.refine}')
         p2s_model.cuda(device=devices[0])  # same order as in training
         p2s_model = torch.nn.DataParallel(p2s_model, device_ids=devices)
-        p2s_model.load_state_dict(torch.load(opt.refine))
+        p2s_model.load_state_dict(torch_load(opt.refine))
         try:
             # expecting a file name like 'vanilla_model_50.pth'
             model_file = str(opt.refine)

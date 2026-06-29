@@ -826,6 +826,7 @@ def make_dataset(dataset_name: str, blensor_bin: str, base_dir: str, num_process
         dir_query_pts_ms = '05_query_pts'
         dir_out_query_vis = '05_query_vis'  # None to disable
         far_query_pts_ratio = 0.5  # 0.1  # not too little or the network fails at the inside classification
+        
         get_query_pts_dist_ms(
             base_dir=base_dir, dataset_dir=dataset_dir, dir_in_mesh=dir_mesh,
             dir_out_query_pts_ms=dir_query_pts_ms,

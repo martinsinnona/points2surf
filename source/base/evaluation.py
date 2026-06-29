@@ -226,6 +226,7 @@ def _chamfer_distance_single_file(file_in, file_ref, samples_per_model, num_proc
     import trimesh.sample
     import sys
     import scipy.spatial as spatial
+    from source.base.point_cloud import kdtree_query
 
     def sample_mesh(mesh_file, num_samples):
         try:
@@ -246,8 +247,8 @@ def _chamfer_distance_single_file(file_in, file_ref, samples_per_model, num_proc
     kdtree_new_mesh_samples = spatial.cKDTree(new_mesh_samples, leaf_size)
     kdtree_ref_mesh_samples = spatial.cKDTree(ref_mesh_samples, leaf_size)
 
-    ref_new_dist, corr_new_ids = kdtree_new_mesh_samples.query(ref_mesh_samples, 1, n_jobs=num_processes)
-    new_ref_dist, corr_ref_ids = kdtree_ref_mesh_samples.query(new_mesh_samples, 1, n_jobs=num_processes)
+    ref_new_dist, corr_new_ids = kdtree_query(kdtree_new_mesh_samples, ref_mesh_samples, k=1, workers=num_processes)
+    new_ref_dist, corr_ref_ids = kdtree_query(kdtree_ref_mesh_samples, new_mesh_samples, k=1, workers=num_processes)
 
     ref_new_dist_sum = np.sum(ref_new_dist)
     new_ref_dist_sum = np.sum(new_ref_dist)

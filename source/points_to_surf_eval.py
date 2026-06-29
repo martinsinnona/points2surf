@@ -11,6 +11,7 @@ from source.points_to_surf_model import PointsToSurfModel
 from source import data_loader
 from source import sdf_nn
 from source.base import file_utils
+from source.base.utils import torch_load
 
 
 def parse_arguments(args=None):
@@ -166,7 +167,7 @@ def make_regressor(train_opt, pred_dim, model_filename, device):
 
     p2s_model.cuda(device=device)  # same order as in training
     p2s_model = torch.nn.DataParallel(p2s_model)
-    p2s_model.load_state_dict(torch.load(model_filename))
+    p2s_model.load_state_dict(torch_load(model_filename))
     p2s_model.eval()
     return p2s_model
 
@@ -313,7 +314,7 @@ def points_to_surf_eval(eval_opt):
         param_filename = os.path.join(eval_opt.modeldir, model_name+eval_opt.parampostfix)
 
         # load model and training parameters
-        train_opt = torch.load(param_filename)
+        train_opt = torch_load(param_filename)
         if not hasattr(train_opt, 'single_transformer'):
             train_opt.single_transformer = 0
         if not hasattr(train_opt, 'shared_transformer'):

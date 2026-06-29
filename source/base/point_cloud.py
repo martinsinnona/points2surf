@@ -167,14 +167,28 @@ def get_patch_radius(grid_res, epsilon):
     return (1.0 + epsilon) / grid_res
 
 
+def kdtree_query(kdtree, x, k=1, workers=1):
+    try:
+        return kdtree.query(x, k=k, workers=workers)
+    except TypeError:
+        return kdtree.query(x, k=k, n_jobs=workers)
+
+
+def kdtree_query_ball_point(kdtree, x, r, workers=1):
+    try:
+        return kdtree.query_ball_point(x, r, workers=workers)
+    except TypeError:
+        return kdtree.query_ball_point(x, r, n_jobs=workers)
+
+
 def get_patch_kdtree(
         kdtree: spatial.cKDTree, rng: np.random.RandomState,
         query_point, patch_radius, points_per_patch, n_jobs):
 
     if patch_radius <= 0.0:
-        pts_dists_ms, patch_pts_ids = kdtree.query(x=query_point, k=points_per_patch, n_jobs=n_jobs)
+        pts_dists_ms, patch_pts_ids = kdtree_query(kdtree, query_point, k=points_per_patch, workers=n_jobs)
     else:
-        patch_pts_ids = kdtree.query_ball_point(x=query_point, r=patch_radius, n_jobs=n_jobs)
+        patch_pts_ids = kdtree_query_ball_point(kdtree, query_point, patch_radius, workers=n_jobs)
     patch_pts_ids = np.array(patch_pts_ids, dtype=np.int32)
     point_count = patch_pts_ids.shape[0]
 

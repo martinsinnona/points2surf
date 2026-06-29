@@ -337,8 +337,9 @@ class PointcloudPatchDataset(data.Dataset):
                 patch_radius=self.patch_radius,
                 points_per_patch=self.points_per_patch, n_jobs=1)
 
-            # find -1 ids for padding
-            patch_pts_pad_ids = patch_pts_ids == -1
+            # find padding ids. scipy cKDTree can use len(points) as the
+            # sentinel for missing neighbors, while older code expected -1.
+            patch_pts_pad_ids = np.logical_or(patch_pts_ids < 0, patch_pts_ids >= shape.pts.shape[0])
             patch_pts_ids[patch_pts_pad_ids] = 0
             pts_patch_ms = shape.pts[patch_pts_ids, :]
             # replace padding points with query point so that they appear in the patch origin
