@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from source import medial_field
+from source import medial_field, points_to_surf_medial
 
 
 class _LinearQueryBackbone(nn.Module):
@@ -51,7 +51,59 @@ class _CoordFeatureMedialModel(nn.Module):
         )
 
     def medial_features(self, bottleneck, batch):
+        if getattr(self, "detach_backbone_for_medial_grad", False):
+            bottleneck = bottleneck.detach()
         return torch.cat((bottleneck, batch["imp_surf_query_point_ms"]), dim=1)
+
+
+class _QuadraticQueryBackbone(nn.Module):
+    def encode_bottleneck(self, batch):
+        query = batch["imp_surf_query_point_ms"]
+        return query[:, :1] ** 2
+
+
+class _QuadraticCoordFeatureModel(nn.Module):
+    def __init__(self, detach_backbone_for_medial_grad=False):
+        super().__init__()
+        self.backbone = _QuadraticQueryBackbone()
+        self.detach_backbone_for_medial_grad = detach_backbone_for_medial_grad
+        self.medial_head = nn.Linear(4, 1, bias=False)
+        with torch.no_grad():
+            self.medial_head.weight.zero_()
+            self.medial_head.weight[0, 0] = 1.0
+            self.medial_head.weight[0, 1] = 1.0
+
+    def medial_features(self, bottleneck, batch):
+        if self.detach_backbone_for_medial_grad:
+            bottleneck = bottleneck.detach()
+        return torch.cat((bottleneck, batch["imp_surf_query_point_ms"]), dim=1)
+
+
+class _TwoBranchQHeadModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.medial_head = nn.Linear(2, 1)
+        self.query_residual_head = nn.Linear(3, 1)
+
+
+class _PredictedSdfQModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Module()
+        self.backbone.encode_bottleneck = lambda batch: batch["imp_surf_query_point_ms"]
+        self.backbone.fc4 = nn.Linear(3, 1, bias=False)
+        self.medial_head = nn.Linear(3, 1)
+        with torch.no_grad():
+            self.backbone.fc4.weight.zero_()
+            self.backbone.fc4.weight[0, 0] = 1.0
+            self.medial_head.weight.zero_()
+            self.medial_head.bias.zero_()
+
+    def medial_features(self, bottleneck, batch):
+        return bottleneck
+
+    def medial_raw_from_features(self, features, batch):
+        return self.medial_head(features)
 
 
 def _unit_sphere_sdf_sampler(query):
@@ -105,6 +157,55 @@ class MedialFieldTest(unittest.TestCase):
         self.assertEqual(grad.shape, query.shape)
         self.assertGreater(float(torch.linalg.norm(grad)), 0.0)
 
+    def test_detach_backbone_for_medial_grad_keeps_query_coord_gradient_only(self):
+        query = torch.tensor([[2.0, 0.0, 0.0]], requires_grad=True)
+        batch = {"imp_surf_query_point_ms": query}
+
+        full_model = _QuadraticCoordFeatureModel(detach_backbone_for_medial_grad=False)
+        detached_model = _QuadraticCoordFeatureModel(detach_backbone_for_medial_grad=True)
+
+        full_q = medial_field.forward_q_with_query_grad(full_model, batch)
+        detached_q = medial_field.forward_q_with_query_grad(detached_model, batch)
+        full_grad = torch.autograd.grad(full_q.sum(), query, retain_graph=True)[0]
+        detached_grad = torch.autograd.grad(detached_q.sum(), query)[0]
+
+        self.assertTrue(torch.allclose(full_grad, torch.tensor([[5.0, 0.0, 0.0]])))
+        self.assertTrue(torch.allclose(detached_grad, torch.tensor([[1.0, 0.0, 0.0]])))
+
+    def test_q_mdf_head_state_dict_preserves_query_residual_branch(self):
+        model = _TwoBranchQHeadModel()
+        with torch.no_grad():
+            model.medial_head.weight.fill_(1.0)
+            model.query_residual_head.weight.fill_(2.0)
+        state = medial_field.q_mdf_head_state_dict(model)
+
+        restored = _TwoBranchQHeadModel()
+        medial_field.load_q_mdf_head_state_dict(restored, state)
+
+        self.assertTrue(torch.allclose(restored.medial_head.weight, model.medial_head.weight))
+        self.assertTrue(torch.allclose(
+            restored.query_residual_head.weight, model.query_residual_head.weight))
+
+    def test_fourier_query_residual_head_keeps_query_gradient(self):
+        model = points_to_surf_medial.PointsToSurfMedialModel(
+            _ConstantRadiusBackbone(),
+            hidden_mult=4.0,
+            use_query_coords=True,
+            detach_backbone_for_medial_grad=True,
+            use_query_residual_head=True,
+            query_residual_encoding="fourier",
+            query_fourier_num_freqs=3,
+        )
+        query = torch.tensor([[0.1, 0.2, 0.3]], requires_grad=True)
+        batch = {"imp_surf_query_point_ms": query}
+
+        medial = medial_field.forward_q_with_query_grad(model, batch)
+        grad = torch.autograd.grad(medial.sum(), query, allow_unused=True)[0]
+
+        self.assertIsNotNone(grad)
+        self.assertEqual(grad.shape, query.shape)
+        self.assertGreater(float(torch.linalg.norm(grad)), 0.0)
+
     def test_attach_sdf_gradient_uses_sampled_value_and_supplied_backward_gradient(self):
         query = torch.tensor([[1.0, 2.0, 3.0]], requires_grad=True)
         phi_const = torch.tensor([7.0])
@@ -115,6 +216,20 @@ class MedialFieldTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(phi.detach(), phi_const))
         self.assertTrue(torch.allclose(grad, supplied_grad))
+
+    def test_box_sdf_gradient_valid_mask_excludes_near_face_ties(self):
+        bounds = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32)
+        query = torch.tensor([
+            [0.1, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [0.1, 0.12, 0.5],
+        ])
+
+        mask = medial_field.box_sdf_gradient_valid_mask(bounds, query, min_face_gap=0.1)
+
+        self.assertTrue(bool(mask[0]))
+        self.assertFalse(bool(mask[1]))
+        self.assertFalse(bool(mask[2]))
 
     def test_project_to_medial_spoke_uses_unsigned_sdf_gradient(self):
         query = torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
@@ -368,6 +483,103 @@ class MedialFieldTest(unittest.TestCase):
         self.assertTrue(torch.allclose(unit_loss, torch.tensor(0.0)))
         self.assertTrue(torch.allclose(non_unit_loss, torch.tensor(0.625)))
         self.assertTrue(torch.allclose(zero_loss, torch.tensor(1.0)))
+
+    def test_eikonal_loss_skips_detached_duplicate_gradient(self):
+        agrad_norm = torch.tensor([[2.0], [0.5]], requires_grad=True)
+        pgrad = torch.zeros((2, 3))
+        pgrad_norm = agrad_norm.detach()
+
+        loss = medial_field.eikonal_loss_from_gradients(agrad_norm, pgrad_norm, pgrad)
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(0.625)))
+
+    def test_predicted_sdf_q_mdf_loss_uses_grad_m_orthogonality(self):
+        model = _PredictedSdfQModel()
+        train_opt = SimpleNamespace(outputs=["imp_surf"], patch_radius=1.0)
+        batch = {
+            "imp_surf_query_point_ms": torch.tensor([[0.5, 0.0, 0.0]], dtype=torch.float32),
+            "patch_radius_ms": torch.tensor([1.0], dtype=torch.float32),
+            "patch_pts_ps": torch.zeros((1, 3, 3), dtype=torch.float32),
+            "imp_surf_ms": torch.tensor([[0.2]], dtype=torch.float32),
+        }
+        weights = medial_field.get_default_weights()
+        for key in weights:
+            weights[key] = 0.0
+        weights.update({
+            "volume_sdf": 1.0,
+            "zero_set_sdf": 1.0,
+            "zero_set_grad": 1.0,
+            "orthogonality": 1.0,
+        })
+
+        loss, parts = medial_field.compute_q_mdf_losses(model, batch, train_opt, weights=weights)
+        loss.backward()
+
+        self.assertIn("Volume SDF", parts)
+        self.assertIn("Zero Set SDF", parts)
+        self.assertIn("Zero Set Gradient", parts)
+        self.assertIn("Orthogonality", parts)
+        self.assertNotIn("Surface Regularizer", parts)
+        self.assertGreater(float(model.medial_head.weight.grad.norm()), 0.0)
+
+    def test_predicted_sdf_q_mdf_loss_applies_q_terms_inside_only(self):
+        model = _PredictedSdfQModel()
+        with torch.no_grad():
+            model.medial_head.weight.zero_()
+            model.medial_head.weight[0, 0] = 1.0
+            model.medial_head.bias.zero_()
+        train_opt = SimpleNamespace(outputs=["imp_surf"], patch_radius=1.0)
+        weights = medial_field.get_default_weights()
+        for key in weights:
+            weights[key] = 0.0
+        weights["orthogonality"] = 1.0
+
+        inside_batch = {
+            "imp_surf_query_point_ms": torch.tensor([[0.5, 0.0, 0.0]], dtype=torch.float32),
+            "patch_radius_ms": torch.tensor([1.0], dtype=torch.float32),
+            "patch_pts_ps": torch.zeros((1, 3, 3), dtype=torch.float32),
+            "imp_surf_ms": torch.tensor([[0.2]], dtype=torch.float32),
+        }
+        mixed_batch = {
+            "imp_surf_query_point_ms": torch.tensor([
+                [0.5, 0.0, 0.0],
+                [-0.5, 0.0, 0.0],
+            ], dtype=torch.float32),
+            "patch_radius_ms": torch.tensor([1.0, 1.0], dtype=torch.float32),
+            "patch_pts_ps": torch.zeros((2, 3, 3), dtype=torch.float32),
+            "imp_surf_ms": torch.tensor([[0.2], [-0.2]], dtype=torch.float32),
+        }
+
+        _, inside_parts = medial_field.compute_q_mdf_losses(
+            model, inside_batch, train_opt, weights=weights)
+        _, mixed_parts = medial_field.compute_q_mdf_losses(
+            model, mixed_batch, train_opt, weights=weights)
+
+        self.assertTrue(torch.allclose(
+            inside_parts["Orthogonality"], mixed_parts["Orthogonality"]))
+
+    def test_predicted_sdf_q_mdf_inscription_uses_matching_inside_batch_rows(self):
+        model = _PredictedSdfQModel()
+        train_opt = SimpleNamespace(outputs=["imp_surf"], patch_radius=1.0)
+        weights = medial_field.get_default_weights()
+        for key in weights:
+            weights[key] = 0.0
+        weights["inscription"] = 1.0
+        batch = {
+            "imp_surf_query_point_ms": torch.tensor([
+                [0.5, 0.0, 0.0],
+                [-0.5, 0.0, 0.0],
+            ], dtype=torch.float32),
+            "patch_radius_ms": torch.tensor([1.0, 1.0], dtype=torch.float32),
+            "patch_pts_ps": torch.zeros((2, 3, 3), dtype=torch.float32),
+            "imp_surf_ms": torch.tensor([[0.2], [-0.2]], dtype=torch.float32),
+        }
+
+        _, parts = medial_field.compute_q_mdf_losses(
+            model, batch, train_opt, weights=weights)
+
+        self.assertIn("Inscription", parts)
+        self.assertTrue(torch.isfinite(parts["Inscription"]))
 
     def test_q_mdf_orthogonality_only_skips_inscription_sdf_sample(self):
         model = _CoordFeatureMedialModel()

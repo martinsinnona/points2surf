@@ -132,6 +132,20 @@ def q_eikonal_loss(q_grad):
     return torch.mean((q_norm - 1.0) ** 2)
 
 
+def eikonal_loss_from_gradients(agrad_norm, pgrad_norm=None, pgrad=None):
+    """
+    Eikonal loss for the active SDF gradient signal.
+
+    When the auxiliary gradient head is disabled, pgrad is usually just a
+    detached copy of agrad.  Counting it again only adds a no-gradient constant
+    to the plotted loss, so include it only when it can receive gradients.
+    """
+    loss = torch.mean((agrad_norm - 1.0) ** 2)
+    if pgrad is not None and pgrad.requires_grad and pgrad_norm is not None:
+        loss = loss + torch.mean((pgrad_norm - 1.0) ** 2)
+    return loss
+
+
 def project_to_medial_spoke(query_ms, sdf, sdf_grad, medial, eps=1e-8):
     """
     Deep Medial Fields Eq. 5:
@@ -162,6 +176,71 @@ def batch_at_queries(batch, queries_ms):
     return out
 
 
+def batch_select_rows(batch, mask):
+    """Select per-query batch rows while leaving scalar/shared metadata unchanged."""
+    out = {}
+    n_rows = mask.shape[0]
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == n_rows:
+            out[key] = value[mask]
+        else:
+            out[key] = value
+    return out
+
+
+def sdf_target_from_batch(batch):
+    """Return GT SDF targets in the inside-negative convention used here."""
+    if 'imp_surf_ms' in batch:
+        target = batch['imp_surf_ms'].to(
+            device=batch['imp_surf_query_point_ms'].device,
+            dtype=batch['imp_surf_query_point_ms'].dtype).view(-1)
+        return -target
+
+    if 'imp_surf_magnitude_ms' not in batch or 'imp_surf_dist_sign_ms' not in batch:
+        return None
+
+    mag = batch['imp_surf_magnitude_ms'].to(
+        device=batch['imp_surf_query_point_ms'].device,
+        dtype=batch['imp_surf_query_point_ms'].dtype).view(-1)
+    sign01 = batch['imp_surf_dist_sign_ms'].to(device=mag.device, dtype=mag.dtype).view(-1)
+    signed_positive_inside = mag * (2.0 * sign01 - 1.0)
+    return -signed_positive_inside
+
+
+def closest_patch_surface_queries(batch):
+    """Pick one observed surface point per patch for zero-set SDF supervision."""
+    if 'patch_pts_ps' not in batch or 'patch_radius_ms' not in batch:
+        return None
+    q = batch['imp_surf_query_point_ms']
+    patch_pts_ps = batch['patch_pts_ps'].to(device=q.device, dtype=q.dtype)
+    patch_radius = batch['patch_radius_ms'].to(device=q.device, dtype=q.dtype).view(-1, 1)
+    closest_id = torch.argmin(torch.linalg.norm(patch_pts_ps, dim=-1), dim=1)
+    closest_ps = patch_pts_ps[torch.arange(patch_pts_ps.shape[0], device=q.device), closest_id]
+    return q + closest_ps * patch_radius
+
+
+def q_mdf_inside_mask_from_batch(batch, sdf):
+    """
+    Select samples where Q-MDF constraints should be evaluated.
+
+    SDF anchors can use mixed inside/outside points, but the Q-MDF medial
+    constraints are intended for inside-shape samples.  Prefer GT SDF targets
+    when available so early predicted-SDF sign mistakes do not flip the Q signal.
+    """
+    target = sdf_target_from_batch(batch)
+    if target is not None:
+        inside_mask = target < -1e-5
+        if not torch.any(inside_mask):
+            inside_mask = target < 0.0
+    else:
+        inside_mask = sdf.detach() < -1e-5
+        if not torch.any(inside_mask):
+            inside_mask = sdf.detach() < 0.0
+    if not torch.any(inside_mask):
+        inside_mask = torch.ones_like(sdf, dtype=torch.bool)
+    return inside_mask
+
+
 def compute_medial_losses(model, batch, train_opt, weights=None, t=0.0):
     """
     Medial + auxiliary auto-supervised losses adapted from MAT-style training.
@@ -179,9 +258,31 @@ def compute_medial_losses(model, batch, train_opt, weights=None, t=0.0):
     agrad_norm = torch.linalg.norm(agrad, dim=-1, keepdim=True).clamp(min=1e-8)
     pgrad_norm = torch.linalg.norm(pgrad, dim=-1, keepdim=True).clamp(min=1e-8)
 
+    if weights["volume_sdf"] > 0:
+        sdf_target = sdf_target_from_batch(batch)
+        if sdf_target is not None:
+            volume_sdf_loss = F.smooth_l1_loss(sdf, sdf_target)
+            loss_dict["Volume SDF"] = volume_sdf_loss
+            total_loss = total_loss + weights["volume_sdf"] * volume_sdf_loss
+
+    if weights["zero_set_sdf"] > 0 or weights["zero_set_grad"] > 0:
+        zero_x = closest_patch_surface_queries(batch)
+        if zero_x is not None:
+            zero_x = zero_x.detach().requires_grad_(True)
+            zero_batch = batch_at_queries(batch, zero_x)
+            zero_sdf, zero_agrad, _, _, _ = model.with_mf_grad(zero_batch, train_opt)
+            if weights["zero_set_sdf"] > 0:
+                zero_set_sdf_loss = torch.mean(zero_sdf ** 2)
+                loss_dict["Zero Set SDF"] = zero_set_sdf_loss
+                total_loss = total_loss + weights["zero_set_sdf"] * zero_set_sdf_loss
+            if weights["zero_set_grad"] > 0:
+                zero_agrad_norm = torch.linalg.norm(zero_agrad, dim=-1).clamp(min=1e-8)
+                zero_set_grad_loss = torch.mean((zero_agrad_norm - 1.0) ** 2)
+                loss_dict["Zero Set Gradient"] = zero_set_grad_loss
+                total_loss = total_loss + weights["zero_set_grad"] * zero_set_grad_loss
+
     if weights["eikonal"] > 0:
-        eikonal_loss = torch.mean((agrad_norm - 1.0) ** 2)
-        eikonal_loss = eikonal_loss + torch.mean((pgrad_norm - 1.0) ** 2)
+        eikonal_loss = eikonal_loss_from_gradients(agrad_norm, pgrad_norm, pgrad)
         loss_dict["Eikonal"] = eikonal_loss
         total_loss = total_loss + weights["eikonal"] * eikonal_loss
 
@@ -332,6 +433,29 @@ def box_sdf_and_gradient(bounds, query_ms, device=None, eps=1e-8):
     return phi, grad
 
 
+def box_sdf_gradient_valid_mask(bounds, query_ms, min_face_gap=0.0, device=None):
+    """
+    Valid differentiable-SDF mask for box samples.
+
+    The box SDF gradient is ambiguous where the nearest face changes.  A positive
+    min_face_gap excludes points whose two nearest faces are too close in
+    distance, i.e. a band around box medial/tie sets.
+    """
+    out_device = query_ms.device if torch.is_tensor(query_ms) else device
+    q = torch.as_tensor(query_ms, dtype=torch.float32, device=out_device)
+    b = torch.as_tensor(bounds, dtype=q.dtype, device=out_device)
+    mins, maxs = b[0], b[1]
+    face_dists = torch.stack((
+        q[:, 0] - mins[0], maxs[0] - q[:, 0],
+        q[:, 1] - mins[1], maxs[1] - q[:, 1],
+        q[:, 2] - mins[2], maxs[2] - q[:, 2],
+    ), dim=-1)
+    inside = torch.all((q >= mins) & (q <= maxs), dim=-1)
+    sorted_dists, _ = torch.sort(face_dists, dim=-1)
+    face_gap = sorted_dists[:, 1] - sorted_dists[:, 0]
+    return inside & (face_gap >= min_face_gap)
+
+
 def forward_medial_with_query_grad(model, batch):
     """
     Run the medial head while keeping autograd paths from M(x) to query x.
@@ -343,6 +467,8 @@ def forward_medial_with_query_grad(model, batch):
     bottleneck = model.backbone.encode_bottleneck(batch)
     if hasattr(model, "medial_features"):
         bottleneck = model.medial_features(bottleneck, batch)
+    if hasattr(model, "medial_raw_from_features"):
+        return model.medial_raw_from_features(bottleneck, batch).squeeze(-1)
     return model.medial_head(bottleneck).squeeze(-1)
 
 
@@ -395,8 +521,7 @@ def compute_medial_losses_with_sdf_sampler(model, batch, sdf_sampler, weights=No
     pgrad_norm = torch.linalg.norm(pgrad, dim=-1, keepdim=True).clamp(min=1e-8)
 
     if weights["eikonal"] > 0:
-        eikonal_loss = torch.mean((agrad_norm - 1.0) ** 2)
-        eikonal_loss = eikonal_loss + torch.mean((pgrad_norm - 1.0) ** 2)
+        eikonal_loss = eikonal_loss_from_gradients(agrad_norm, pgrad_norm, pgrad)
         loss_dict["Eikonal"] = eikonal_loss
 
     if weights["predicted_grad"] > 0:
@@ -466,12 +591,39 @@ def q_to_medial(q_value, phi_value):
     return q_value + torch.abs(phi_value)
 
 
+def q_mdf_head_state_dict(model):
+    """State for every trainable branch that contributes to Q-MDF."""
+    state = {"medial_head": model.medial_head.state_dict()}
+    if hasattr(model, "query_residual_head"):
+        state["query_residual_head"] = model.query_residual_head.state_dict()
+    return state
+
+
+def load_q_mdf_head_state_dict(model, state, strict=True):
+    """Load Q-MDF head state, accepting older medial-head-only checkpoints."""
+    if "medial_head" not in state:
+        model.medial_head.load_state_dict(state, strict=strict)
+        return
+    model.medial_head.load_state_dict(state["medial_head"], strict=strict)
+    if "query_residual_head" in state and hasattr(model, "query_residual_head"):
+        model.query_residual_head.load_state_dict(state["query_residual_head"], strict=strict)
+
+
 def forward_q_with_query_grad(model, batch):
     """Run the trainable Q head while preserving query-position gradients."""
     bottleneck = model.backbone.encode_bottleneck(batch)
     if hasattr(model, "medial_features"):
         bottleneck = model.medial_features(bottleneck, batch)
+    if hasattr(model, "medial_raw_from_features"):
+        return model.medial_raw_from_features(bottleneck, batch).squeeze(-1)
     return model.medial_head(bottleneck).squeeze(-1)
+
+
+def medial_raw_from_features(model, features, batch):
+    """Evaluate the trainable medial/Q head, including optional query-only branch."""
+    if hasattr(model, "medial_raw_from_features"):
+        return model.medial_raw_from_features(features, batch).squeeze(-1)
+    return model.medial_head(features).squeeze(-1)
 
 
 def q_mdf_features_with_query_grad(model, batch):
@@ -521,7 +673,8 @@ def bind_q_mdf_model(model):
         bottleneck = self.backbone.encode_bottleneck(batch_data)
         sdf_raw = self.backbone.fc4(bottleneck)
         phi = process_sdf_prediction(sdf_raw, train_opt, batch_data['patch_radius_ms'])
-        q_pred = post_process_medial(self.medial_head(self.medial_features(bottleneck, batch_data)))
+        q_pred = post_process_medial(
+            medial_raw_from_features(self, self.medial_features(bottleneck, batch_data), batch_data))
         mf = q_to_medial(q_pred, phi)
 
         agrad = torch.autograd.grad(
@@ -536,13 +689,181 @@ def bind_q_mdf_model(model):
         pgrad = agrad.detach()
         return phi, agrad, pgrad, mf, mf_grad
 
+    model.predict_q_mdf = True
     model.with_mf_grad = types.MethodType(with_q_mdf_grad, model)
     return model
 
 
+def compute_q_mdf_losses(model, batch, train_opt, weights=None, t=0.0):
+    """
+    Q-MDF losses using the model's predicted SDF.
+
+    The trainable head predicts Q and reconstructs M = Q + |phi| for the DMF
+    constraints, including the original orthogonality objective
+    grad M . grad phi = 0.  SDF supervision comes from the explicit
+    predicted-SDF anchors that are enabled in the weights, typically volume SDF
+    and zero-set terms.
+    """
+    if weights is None:
+        weights = get_default_weights()
+
+    batch = {
+        k: (v.clone() if torch.is_tensor(v) else v)
+        for k, v in batch.items()
+    }
+    volume_x = batch['imp_surf_query_point_ms']
+    if not volume_x.requires_grad:
+        volume_x = volume_x.detach().requires_grad_(True)
+        batch['imp_surf_query_point_ms'] = volume_x
+
+    total_loss = torch.tensor(0.0, device=volume_x.device)
+    loss_dict = {}
+
+    bottleneck = model.backbone.encode_bottleneck(batch)
+    sdf_raw = model.backbone.fc4(bottleneck)
+    sdf = process_sdf_prediction(sdf_raw, train_opt, batch['patch_radius_ms'])
+    q_features = model.medial_features(bottleneck, batch) if hasattr(model, "medial_features") else bottleneck
+    q_pred = post_process_medial(medial_raw_from_features(model, q_features, batch))
+    mf = q_to_medial(q_pred, sdf)
+
+    sdf_grad_create_graph = any(weights.get(k, 0.0) > 0 for k in (
+        "eikonal", "inscription", "orthogonality", "curvature"))
+    agrad = torch.autograd.grad(
+        sdf.sum(), volume_x, create_graph=sdf_grad_create_graph,
+        retain_graph=True, allow_unused=True)[0]
+    if agrad is None:
+        agrad = torch.zeros_like(volume_x)
+    mf_grad = None
+    if weights.get("orthogonality", 0.0) > 0:
+        mf_grad = torch.autograd.grad(
+            mf.sum(), volume_x, create_graph=True, retain_graph=True, allow_unused=True)[0]
+        if mf_grad is None:
+            mf_grad = torch.zeros_like(volume_x)
+    q_grad = None
+    if weights.get("q_eikonal", 0.0) > 0:
+        q_grad = torch.autograd.grad(
+            q_pred.sum(), volume_x, create_graph=True, retain_graph=True, allow_unused=True)[0]
+        if q_grad is None:
+            q_grad = torch.zeros_like(volume_x)
+    pgrad = agrad.detach()
+
+    agrad_norm = torch.linalg.norm(agrad, dim=-1, keepdim=True).clamp(min=1e-8)
+    pgrad_norm = torch.linalg.norm(pgrad, dim=-1, keepdim=True).clamp(min=1e-8)
+    q_loss_mask = q_mdf_inside_mask_from_batch(batch, sdf)
+    volume_x_q = volume_x[q_loss_mask]
+    mf_q = mf[q_loss_mask]
+    sdf_q = sdf[q_loss_mask]
+    agrad_q = agrad[q_loss_mask]
+    mf_grad_q = mf_grad[q_loss_mask] if mf_grad is not None else None
+    q_grad_q = q_grad[q_loss_mask] if q_grad is not None else None
+    q_batch = batch_select_rows(batch, q_loss_mask)
+
+    if weights["volume_sdf"] > 0:
+        sdf_target = sdf_target_from_batch(batch)
+        if sdf_target is not None:
+            volume_sdf_loss = F.smooth_l1_loss(sdf, sdf_target)
+            loss_dict["Volume SDF"] = volume_sdf_loss
+            total_loss = total_loss + weights["volume_sdf"] * volume_sdf_loss
+
+    if weights["zero_set_sdf"] > 0 or weights["zero_set_grad"] > 0:
+        zero_x = closest_patch_surface_queries(batch)
+        if zero_x is not None:
+            zero_x = zero_x.detach().requires_grad_(True)
+            zero_batch = batch_at_queries(batch, zero_x)
+            zero_bottleneck = model.backbone.encode_bottleneck(zero_batch)
+            zero_sdf_raw = model.backbone.fc4(zero_bottleneck)
+            zero_sdf = process_sdf_prediction(
+                zero_sdf_raw, train_opt, zero_batch['patch_radius_ms'])
+            if weights["zero_set_sdf"] > 0:
+                zero_set_sdf_loss = torch.mean(zero_sdf ** 2)
+                loss_dict["Zero Set SDF"] = zero_set_sdf_loss
+                total_loss = total_loss + weights["zero_set_sdf"] * zero_set_sdf_loss
+            if weights["zero_set_grad"] > 0:
+                zero_agrad = torch.autograd.grad(
+                    zero_sdf.sum(), zero_x, create_graph=True, allow_unused=True)[0]
+                if zero_agrad is None:
+                    zero_agrad = torch.zeros_like(zero_x)
+                zero_agrad_norm = torch.linalg.norm(zero_agrad, dim=-1).clamp(min=1e-8)
+                zero_set_grad_loss = torch.mean((zero_agrad_norm - 1.0) ** 2)
+                loss_dict["Zero Set Gradient"] = zero_set_grad_loss
+                total_loss = total_loss + weights["zero_set_grad"] * zero_set_grad_loss
+
+    if weights["eikonal"] > 0:
+        eikonal_loss = eikonal_loss_from_gradients(agrad_norm, pgrad_norm, pgrad)
+        loss_dict["Eikonal"] = eikonal_loss
+        total_loss = total_loss + weights["eikonal"] * eikonal_loss
+
+    if weights.get("q_eikonal", 0.0) > 0:
+        q_eik_loss = q_eikonal_loss(q_grad_q)
+        loss_dict["Q Eikonal"] = q_eik_loss
+        total_loss = total_loss + weights["q_eikonal"] * q_eik_loss
+
+    if weights["predicted_grad"] > 0:
+        predicted_grad_loss = torch.mean((agrad - pgrad) ** 2)
+        loss_dict["Gradient Prediction"] = predicted_grad_loss
+        total_loss = total_loss + weights["predicted_grad"] * predicted_grad_loss
+
+    if weights.get("sdf_gradient", 0.0) > 0 and hasattr(model, "sdf_gradient_head"):
+        sdf_gradient_loss = F.smooth_l1_loss(model.sdf_gradient_head(q_features), agrad.detach())
+        loss_dict["SDF Gradient"] = sdf_gradient_loss
+        total_loss = total_loss + weights["sdf_gradient"] * sdf_gradient_loss
+
+    if weights["surface_reg"] > 0:
+        surface_reg_loss = torch.mean(torch.exp(-100.0 * torch.abs(sdf)))
+        loss_dict["Surface Regularizer"] = surface_reg_loss
+        total_loss = total_loss + weights["surface_reg"] * surface_reg_loss
+
+    if weights["curvature"] > 0:
+        n_curv = min(2048, volume_x.shape[0])
+        curv_x = volume_x[:n_curv].clone().detach().requires_grad_(True)
+        curv_batch = batch_at_queries(batch, curv_x)
+        curv_q = post_process_medial(forward_q_with_query_grad(model, curv_batch))
+        curv_sdf_raw = model.backbone.fc4(model.backbone.encode_bottleneck(curv_batch))
+        curv_sdf = process_sdf_prediction(
+            curv_sdf_raw, train_opt, curv_batch['patch_radius_ms'])
+        curv_mf = q_to_medial(curv_q, curv_sdf)
+        curv_grad = torch.autograd.grad(
+            curv_mf.sum(), curv_x, create_graph=True, allow_unused=True)[0]
+        if curv_grad is None:
+            curv_grad = torch.zeros_like(curv_x)
+        curvature = []
+        for i in range(curv_grad.shape[-1]):
+            g = torch.autograd.grad(
+                curv_grad[:, i].sum(), curv_x, create_graph=True)[0][:, i]
+            curvature.append(g)
+        curvature = torch.stack(curvature, dim=-1)
+        curvature_loss = torch.mean(torch.sum(torch.abs(curvature), dim=0))
+        loss_dict["Curvature"] = curvature_loss
+        sched = 10 ** (-(1.0 + 4.0 * t))
+        total_loss = total_loss + weights["curvature"] * sched * curvature_loss
+
+    if weights["maximality"] > 0:
+        maximality_loss = torch.mean(F.relu(torch.abs(sdf_q) - mf_q) ** 2)
+        loss_dict["Maximality"] = maximality_loss
+        total_loss = total_loss + weights["maximality"] * maximality_loss
+
+    if weights["inscription"] > 0:
+        c = project_to_medial_spoke(volume_x_q, sdf_q, agrad_q, mf_q)
+        c_batch = batch_at_queries(q_batch, c)
+        c_bottleneck = model.backbone.encode_bottleneck(c_batch)
+        c_sdf_raw = model.backbone.fc4(c_bottleneck)
+        c_sdf = process_sdf_prediction(c_sdf_raw, train_opt, c_batch['patch_radius_ms'])
+        inscription_loss = torch.mean((torch.abs(c_sdf) - mf_q) ** 2)
+        loss_dict["Inscription"] = inscription_loss
+        total_loss = total_loss + weights["inscription"] * inscription_loss
+
+    if weights["orthogonality"] > 0:
+        orth_loss = orthogonality_loss(mf_grad_q, agrad_q)
+        loss_dict["Orthogonality"] = orth_loss
+        total_loss = total_loss + weights["orthogonality"] * orth_loss
+
+    loss_dict["Total"] = total_loss
+    return total_loss, loss_dict
+
+
 def compute_q_mdf_losses_with_sdf_sampler(
         model, batch, sdf_sampler, weights=None, t=0.0,
-        sdf_gradient_target_sampler=None):
+        sdf_gradient_target_sampler=None, sdf_valid_mask_sampler=None):
     """
     Train a head that predicts Q-MDF directly.
 
@@ -565,11 +886,17 @@ def compute_q_mdf_losses_with_sdf_sampler(
     loss_dict = {}
 
     q_features = q_mdf_features_with_query_grad(model, batch)
-    q_all = post_process_medial(model.medial_head(q_features).squeeze(-1))
+    q_all = post_process_medial(medial_raw_from_features(model, q_features, batch))
     sdf_all, agrad_all = sdf_sampler(volume_x)
     mf_all = q_to_medial(q_all, sdf_all)
+    mf_grad_all = None
+    if weights.get("orthogonality", 0.0) > 0:
+        mf_grad_all = torch.autograd.grad(
+            mf_all.sum(), volume_x, create_graph=True, retain_graph=True, allow_unused=True)[0]
+        if mf_grad_all is None:
+            mf_grad_all = torch.zeros_like(volume_x)
     q_grad_all = None
-    if weights.get("orthogonality", 0.0) > 0 or weights.get("q_eikonal", 0.0) > 0:
+    if weights.get("q_eikonal", 0.0) > 0:
         q_grad_all = torch.autograd.grad(
             q_all.sum(), volume_x, create_graph=True, retain_graph=True, allow_unused=True)[0]
         if q_grad_all is None:
@@ -578,11 +905,18 @@ def compute_q_mdf_losses_with_sdf_sampler(
     inside_mask = sdf_all < -1e-5
     if not torch.any(inside_mask):
         inside_mask = sdf_all < 0.0
+    fallback_inside_mask = inside_mask
+    if sdf_valid_mask_sampler is not None:
+        valid_mask = sdf_valid_mask_sampler(volume_x).to(device=volume_x.device, dtype=torch.bool)
+        inside_mask = inside_mask & valid_mask
+    if not torch.any(inside_mask):
+        inside_mask = fallback_inside_mask
     if not torch.any(inside_mask):
         inside_mask = torch.ones_like(sdf_all, dtype=torch.bool)
 
     q_pred = q_all[inside_mask]
     mf = mf_all[inside_mask]
+    mf_grad = mf_grad_all[inside_mask] if mf_grad_all is not None else None
     q_grad = q_grad_all[inside_mask] if q_grad_all is not None else None
     sdf_vals = sdf_all[inside_mask]
     agrad = agrad_all[inside_mask]
@@ -601,8 +935,7 @@ def compute_q_mdf_losses_with_sdf_sampler(
         total_loss = total_loss + weights["sdf_gradient"] * sdf_gradient_loss
 
     if weights["eikonal"] > 0:
-        eikonal_loss = torch.mean((agrad_norm - 1.0) ** 2)
-        eikonal_loss = eikonal_loss + torch.mean((pgrad_norm - 1.0) ** 2)
+        eikonal_loss = eikonal_loss_from_gradients(agrad_norm, pgrad_norm, pgrad)
         loss_dict["Eikonal"] = eikonal_loss
         total_loss = total_loss + weights["eikonal"] * eikonal_loss
 
@@ -656,7 +989,7 @@ def compute_q_mdf_losses_with_sdf_sampler(
         total_loss = total_loss + weights["inscription"] * inscription_loss
 
     if weights["orthogonality"] > 0:
-        orth_loss = q_mdf_direction_loss(q_grad, sdf_vals, agrad)
+        orth_loss = orthogonality_loss(mf_grad, agrad)
         loss_dict["Orthogonality"] = orth_loss
         total_loss = total_loss + weights["orthogonality"] * orth_loss
 
@@ -666,12 +999,13 @@ def compute_q_mdf_losses_with_sdf_sampler(
 
 def compute_q_mdf_losses_gt_sdf(
         model, batch, train_opt, mesh_gt, weights=None, t=0.0,
-        sdf_gradient_target_sampler=None):
+        sdf_gradient_target_sampler=None, sdf_valid_mask_sampler=None):
     """Q-MDF loss variant using GT mesh SDF and no direct GT Q-MDF target."""
     return compute_q_mdf_losses_with_sdf_sampler(
         model, batch,
         lambda query_ms: gt_sdf_and_gradient(mesh_gt, query_ms, device=query_ms.device),
-        weights=weights, t=t, sdf_gradient_target_sampler=sdf_gradient_target_sampler)
+        weights=weights, t=t, sdf_gradient_target_sampler=sdf_gradient_target_sampler,
+        sdf_valid_mask_sampler=sdf_valid_mask_sampler)
 
 
 def _make_query_batch(query_pts_ms, pts_ms, kdtree, train_opt, rng, rng_global, device):
@@ -999,7 +1333,8 @@ def predict_q_and_medial_on_queries(
 
 def evaluate_medial_orthogonality_on_queries(
         model, train_opt, query_pts_ms, pts_ms, device, batch_size=64,
-        mesh_gt_sdf=None, inside_only=True, sdf_sampler=None):
+        mesh_gt_sdf=None, inside_only=True, sdf_sampler=None,
+        sdf_valid_mask_sampler=None):
     """Measure how much grad M points along grad phi on arbitrary queries."""
     import scipy.spatial as spatial
 
@@ -1052,6 +1387,9 @@ def evaluate_medial_orthogonality_on_queries(
         mask = torch.isfinite(sdf_vals)
         if inside_only:
             mask = mask & (sdf_vals < 0.0)
+        if sdf_valid_mask_sampler is not None:
+            valid_mask = sdf_valid_mask_sampler(q_pts).to(device=q_pts.device, dtype=torch.bool)
+            mask = mask & valid_mask
         if not torch.any(mask):
             continue
 
@@ -1082,6 +1420,113 @@ def evaluate_medial_orthogonality_on_queries(
         "orth_normal_rms": float(torch.sqrt(torch.mean(normal_all ** 2))),
         "orth_cos_abs_mean": float(torch.mean(torch.abs(cosine_all))),
         "orth_cos_rms": float(torch.sqrt(torch.mean(cosine_all ** 2))),
+    }
+
+
+def evaluate_q_mdf_gradient_objective_on_queries(
+        model, train_opt, query_pts_ms, pts_ms, device, batch_size=64,
+        mesh_gt_sdf=None, inside_only=True, sdf_sampler=None,
+        sdf_valid_mask_sampler=None):
+    """Measure Q-MDF direction and Q-eikonal residuals on arbitrary queries."""
+    import scipy.spatial as spatial
+
+    query_pts_ms = np.asarray(query_pts_ms, dtype=np.float32)
+    pts_ms = np.asarray(pts_ms, dtype=np.float32)
+    if query_pts_ms.shape[0] == 0:
+        return {
+            "q_grad_count": 0,
+            "q_direction_abs_mean": None,
+            "q_direction_rms": None,
+            "q_objective_rms": None,
+            "q_normal_mean": None,
+            "q_eikonal_abs_mean": None,
+            "q_eikonal_rms": None,
+            "q_grad_norm_mean": None,
+        }
+
+    kdtree = spatial.cKDTree(pts_ms)
+    rng = np.random.RandomState(0)
+    rng_global = np.random.RandomState(1)
+
+    direction_residuals = []
+    normal_components = []
+    eikonal_residuals = []
+    grad_norms = []
+    count = 0
+
+    model.eval()
+    for start in range(0, query_pts_ms.shape[0], batch_size):
+        end = min(start + batch_size, query_pts_ms.shape[0])
+        batch = _make_query_batch(
+            query_pts_ms[start:end], pts_ms, kdtree, train_opt, rng, rng_global, device)
+        q_pts = batch['imp_surf_query_point_ms'].detach().requires_grad_(True)
+        batch['imp_surf_query_point_ms'] = q_pts
+
+        q_pred = post_process_medial(forward_q_with_query_grad(model, batch))
+        q_grad = torch.autograd.grad(
+            q_pred.sum(), q_pts, create_graph=False, allow_unused=True)[0]
+        if q_grad is None:
+            q_grad = torch.zeros_like(q_pts)
+
+        if sdf_sampler is not None:
+            sdf_vals, agrad = sdf_sampler(q_pts)
+        elif mesh_gt_sdf is None:
+            sdf_vals, agrad, _, _, _ = model.with_mf_grad(batch, train_opt)
+        else:
+            sdf_vals, agrad = gt_sdf_and_gradient(mesh_gt_sdf, q_pts, device=device)
+
+        mask = torch.isfinite(sdf_vals)
+        if inside_only:
+            mask = mask & (sdf_vals < 0.0)
+        if sdf_valid_mask_sampler is not None:
+            valid_mask = sdf_valid_mask_sampler(q_pts).to(device=q_pts.device, dtype=torch.bool)
+            mask = mask & valid_mask
+        if not torch.any(mask):
+            continue
+
+        q_grad_sel = q_grad[mask]
+        sdf_vals_sel = sdf_vals[mask]
+        agrad_sel = agrad[mask]
+        sdf_norm = torch.linalg.norm(agrad_sel, dim=-1, keepdim=True).clamp(min=1e-8)
+        sdf_unit = agrad_sel / sdf_norm
+        q_normal = torch.sum(q_grad_sel * sdf_unit, dim=-1)
+        sdf_sign = torch.where(
+            sdf_vals_sel >= 0.0, torch.ones_like(sdf_vals_sel), -torch.ones_like(sdf_vals_sel))
+        target = -sdf_sign * sdf_norm.squeeze(-1)
+        q_grad_norm = torch.linalg.norm(q_grad_sel, dim=-1)
+        direction_residuals.append((q_normal - target).detach().cpu())
+        normal_components.append(q_normal.detach().cpu())
+        eikonal_residuals.append((q_grad_norm - 1.0).detach().cpu())
+        grad_norms.append(q_grad_norm.detach().cpu())
+        count += int(mask.sum().detach().cpu())
+
+    if count == 0:
+        return {
+            "q_grad_count": 0,
+            "q_direction_abs_mean": None,
+            "q_direction_rms": None,
+            "q_objective_rms": None,
+            "q_normal_mean": None,
+            "q_eikonal_abs_mean": None,
+            "q_eikonal_rms": None,
+            "q_grad_norm_mean": None,
+        }
+
+    direction_all = torch.cat(direction_residuals)
+    normal_all = torch.cat(normal_components)
+    eikonal_all = torch.cat(eikonal_residuals)
+    grad_norm_all = torch.cat(grad_norms)
+    direction_rms = torch.sqrt(torch.mean(direction_all ** 2))
+    eikonal_rms = torch.sqrt(torch.mean(eikonal_all ** 2))
+    return {
+        "q_grad_count": count,
+        "q_direction_abs_mean": float(torch.mean(torch.abs(direction_all))),
+        "q_direction_rms": float(direction_rms),
+        "q_objective_rms": float(torch.sqrt(direction_rms ** 2 + eikonal_rms ** 2)),
+        "q_normal_mean": float(torch.mean(normal_all)),
+        "q_eikonal_abs_mean": float(torch.mean(torch.abs(eikonal_all))),
+        "q_eikonal_rms": float(eikonal_rms),
+        "q_grad_norm_mean": float(torch.mean(grad_norm_all)),
     }
 
 
