@@ -72,6 +72,22 @@ def plot_training_history(history):
     return fig
 
 
+def plot_medial_training_history(history):
+    """Plot the three raw DMF losses and their weighted sum separately."""
+    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    epochs = np.arange(1, len(history['medial_total']) + 1)
+    for name in ('maximality', 'inscription', 'orthogonality'):
+        ax.plot(epochs, history[name], label=name)
+    ax.plot(epochs, history['medial_total'], color='black', linewidth=2,
+            label='weighted total')
+    ax.set(xlabel='epoch', ylabel='medial loss', yscale='log')
+    ax.set_title('Interior medial-field losses', fontsize=10, pad=12)
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout(pad=1.5)
+    return fig
+
+
 def plot_mse_comparison(histories):
     """Compare uniform-volume and medial-axis SDF MSE across experiments."""
     fig, (volume_ax, medial_ax) = plt.subplots(1, 2, figsize=(11.5, 4.0),
@@ -94,14 +110,17 @@ def plot_mse_comparison(histories):
     return fig
 
 
-def plot_sdf_slices(mesh, predict_sdf, slice_zs=(0.0, 0.25), resolution=128,
+def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
+                     slice_zs=(0.0, 0.25), resolution=128,
                      axis_limit=0.65, isoline_spacing=0.05,
                      interior_gamma=2.0):
-    """Compare SDF slices with high interior contrast and fixed-distance isolines."""
+    """Compare predicted/GT SDF by row and optionally show interior M at z=0."""
     if isoline_spacing <= 0:
         raise ValueError('isoline_spacing must be positive.')
     if interior_gamma <= 0:
         raise ValueError('interior_gamma must be positive.')
+    if len(slice_zs) != 2:
+        raise ValueError('This comparison expects exactly two slice_zs.')
     axis_values = np.linspace(-axis_limit, axis_limit, resolution, dtype=np.float32)
     xx, yy = np.meshgrid(axis_values, axis_values)
     fields = []
@@ -143,15 +162,20 @@ def plot_sdf_slices(mesh, predict_sdf, slice_zs=(0.0, 0.25), resolution=128,
     level_count = int(np.ceil(level_limit / isoline_spacing))
     levels = np.arange(-level_count, level_count + 1) * isoline_spacing
     levels = levels[~np.isclose(levels, 0.0)]
-    fig = plt.figure(figsize=(7, 5.95), constrained_layout=True)
-    grid = fig.add_gridspec(2, 2, wspace=0.03, hspace=0.03)
+    column_count = 3 if predict_medial is not None else 2
+    fig = plt.figure(figsize=(10.4 if predict_medial is not None else 7.0, 6.4),
+                     constrained_layout=True)
+    grid = fig.add_gridspec(2, column_count, wspace=0.04, hspace=0.04)
     axes = np.empty((2, 2), dtype=object)
-    for row, (z, predicted, gt) in enumerate(fields):
-        for column, (field, title) in enumerate(((predicted, 'Predicted SDF'), (gt, 'GT SDF'))):
+    sdf_image = None
+    for column, (z, predicted, gt) in enumerate(fields):
+        for row, (field, row_label) in enumerate(
+                ((predicted, 'Predicted SDF'), (gt, 'GT SDF'))):
             ax = fig.add_subplot(grid[row, column])
             axes[row, column] = ax
-            image = ax.imshow(field, origin='lower', extent=[axis_values[0], axis_values[-1]] * 2,
-                              cmap='coolwarm', norm=color_norm)
+            sdf_image = ax.imshow(
+                field, origin='lower', extent=[axis_values[0], axis_values[-1]] * 2,
+                cmap='coolwarm', norm=color_norm)
             visible_levels = levels[(levels > field.min()) & (levels < field.max())]
             if len(visible_levels):
                 ax.contour(xx, yy, field, levels=visible_levels,
@@ -166,10 +190,48 @@ def plot_sdf_slices(mesh, predict_sdf, slice_zs=(0.0, 0.25), resolution=128,
             for spine in ax.spines.values():
                 spine.set_visible(False)
             if row == 0:
-                ax.set_title(title, fontsize=10, pad=12)
-        axes[row, 0].set_ylabel(f'z = {z:g}', rotation=90, fontsize=11, labelpad=18)
-    fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.78, pad=0.02,
-                 label='signed distance')
+                ax.set_title(f'z = {z:g}', fontsize=10, pad=10)
+            if column == 0:
+                ax.set_ylabel(row_label, fontsize=10, labelpad=12)
+
+    sdf_ticks = [-negative_limit, -negative_limit / 2.0, 0.0,
+                 positive_limit / 2.0, positive_limit]
+    sdf_bar = fig.colorbar(
+        sdf_image, ax=axes.ravel().tolist(), orientation='horizontal',
+        fraction=0.055, pad=0.06, aspect=32, label='signed distance')
+    sdf_bar.set_ticks(sdf_ticks, labels=[f'{tick:.2f}' for tick in sdf_ticks])
+
+    if predict_medial is not None:
+        z = slice_zs[0]
+        queries = np.column_stack((xx.ravel(), yy.ravel(),
+                                   np.full(xx.size, z, dtype=np.float32)))
+        medial = predict_medial(queries).reshape(resolution, resolution)
+        gt_sdf = fields[0][2]
+        interior_medial = np.ma.masked_where(gt_sdf >= 0.0, medial)
+        visible_medial = medial[gt_sdf < 0.0]
+        medial_limit = max(float(np.percentile(visible_medial, 99.0)), 1e-6)
+        medial_ax = fig.add_subplot(grid[:, 2])
+        medial_cmap = plt.get_cmap('viridis').copy()
+        medial_cmap.set_bad('#eeeeee')
+        medial_image = medial_ax.imshow(
+            interior_medial, origin='lower',
+            extent=[axis_values[0], axis_values[-1]] * 2,
+            cmap=medial_cmap, vmin=0.0, vmax=medial_limit)
+        medial_ax.contour(xx, yy, gt_sdf, levels=[0.0], colors='black',
+                          linewidths=1.1)
+        medial_ax.set(aspect='equal')
+        medial_ax.set_title(f'Interior medial field M\nz = {z:g}',
+                            fontsize=10, pad=10)
+        medial_ax.set_xticks([])
+        medial_ax.set_yticks([])
+        for spine in medial_ax.spines.values():
+            spine.set_visible(False)
+        medial_ticks = np.linspace(0.0, medial_limit, 4)
+        medial_bar = fig.colorbar(
+            medial_image, ax=medial_ax, orientation='horizontal',
+            fraction=0.055, pad=0.06, aspect=16, label='medial radius M')
+        medial_bar.set_ticks(
+            medial_ticks, labels=[f'{tick:.2f}' for tick in medial_ticks])
     return fig
 
 

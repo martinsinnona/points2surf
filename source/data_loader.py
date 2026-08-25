@@ -218,7 +218,7 @@ class PointcloudPatchDataset(data.Dataset):
                  cache_capacity=1, point_count_std=0.0,
                  pre_processed_patches=False, query_grid_resolution=None,
                  sub_sample_size=500, reconstruction=False, uniform_subsample=False, fixed_subsample=False,
-                 num_workers=1):
+                 num_workers=1, do_augmentation=True):
 
         # initialize parameters
         self.root = root
@@ -238,6 +238,7 @@ class PointcloudPatchDataset(data.Dataset):
         self.epsilon = epsilon
         self.uniform_subsample = uniform_subsample
         self.fixed_subsample = fixed_subsample
+        self.do_augmentation = do_augmentation
 
         self.include_connectivity = False
         self.include_imp_surf = False
@@ -379,7 +380,7 @@ class PointcloudPatchDataset(data.Dataset):
         else:
             pts_sub_sample_ms = np.array([], dtype=np.float32)
 
-        if not self.reconstruction:
+        if not self.reconstruction and self.do_augmentation:
             import trimesh.transformations as trafo
             # random rotation of shape and patch as data augmentation
             rand_rot = trimesh.transformations.random_rotation_matrix(self.rng.rand(3))
