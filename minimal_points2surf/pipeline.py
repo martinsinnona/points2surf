@@ -45,6 +45,22 @@ class SDFGrid:
     upper: torch.Tensor
 
 
+class MedialQueryDataset(Dataset):
+    """Query-only interior samples for self-supervised medial training."""
+
+    def __init__(self, query_points):
+        self.query_points = torch.as_tensor(query_points, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.query_points)
+
+    def __getitem__(self, index):
+        return {
+            'imp_surf_query_point_ms': self.query_points[index],
+            'imp_surf_dist_sign_ms': torch.tensor(0.0),
+        }
+
+
 def seed_everything(seed):
     """Seed the random generators used by this small experiment."""
     random.seed(seed)
@@ -176,16 +192,14 @@ def make_medial_optimizer(model, learning_rate):
     return torch.optim.Adam(model.medial_head.parameters(), lr=learning_rate)
 
 
-def add_query_medial_head(model, hidden_size=64, smooth=True):
+def add_query_medial_head(model, hidden_size=64, hidden_layers=2, smooth=True):
     """Attach a small interior medial-field head M(x) that sees only query xyz."""
     activation = lambda: nn.Softplus(beta=100) if smooth else nn.ReLU()
-    head = nn.Sequential(
-        nn.Linear(3, hidden_size),
-        activation(),
-        nn.Linear(hidden_size, hidden_size),
-        activation(),
-        nn.Linear(hidden_size, 1),
-    )
+    layers = [nn.Linear(3, hidden_size), activation()]
+    for _ in range(hidden_layers - 1):
+        layers.extend((nn.Linear(hidden_size, hidden_size), activation()))
+    layers.append(nn.Linear(hidden_size, 1))
+    head = nn.Sequential(*layers)
     nn.init.constant_(head[-1].bias, -1.25)
     model.medial_head = head.to(next(model.parameters()).device)
     return model
@@ -440,6 +454,45 @@ def sample_sdf_grid(sdf_grid, queries):
         padding_mode='border', align_corners=True).reshape(-1)
 
 
+def predict_sdf_grid_queries(sdf_grid, queries, batch_size=65536):
+    """Evaluate the cached learned SDF quickly for NumPy query points."""
+    queries = np.asarray(queries, dtype=np.float32)
+    predictions = []
+    with torch.no_grad():
+        for start in range(0, len(queries), batch_size):
+            batch_queries = torch.from_numpy(
+                queries[start:start + batch_size]).to(sdf_grid.values.device)
+            predictions.append(
+                sample_sdf_grid(sdf_grid, batch_queries).cpu().numpy())
+    return np.concatenate(predictions)
+
+
+def make_medial_training_loader(sdf_grid, bounds, num_points, batch_size, seed):
+    """Make one shuffled pass over fixed uniform interior queries per epoch."""
+    bounds = np.asarray(bounds, dtype=np.float32)
+    rng = np.random.RandomState(seed)
+    interior_points = []
+    num_collected = 0
+    empty_batches = 0
+    while num_collected < num_points:
+        candidates = rng.uniform(
+            bounds[0], bounds[1], size=(max(4096, 3 * (num_points - num_collected)), 3)
+        ).astype(np.float32)
+        candidates = candidates[
+            predict_sdf_grid_queries(sdf_grid, candidates) < 0.0]
+        empty_batches = empty_batches + 1 if len(candidates) == 0 else 0
+        if empty_batches == 10:
+            raise ValueError('Frozen SDF grid has no interior samples in bounds.')
+        interior_points.append(candidates)
+        num_collected += len(candidates)
+    dataset = MedialQueryDataset(
+        np.concatenate(interior_points, axis=0)[:num_points])
+    generator = torch.Generator().manual_seed(seed)
+    loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, generator=generator)
+    return dataset, loader
+
+
 def predict_medial_queries(model, queries, device, batch_size=4096):
     """Evaluate the query-only interior medial head on arbitrary xyz points."""
     queries = np.asarray(queries, dtype=np.float32)
@@ -461,6 +514,22 @@ def evaluate_box_medial_head(model, bounds, device, grid_resolution=33,
         seed=seed)
     prediction = predict_medial_queries(model, axis_points, device)
     return medial_field.medial_axis_field_metrics(prediction, axis_radii)
+
+
+def evaluate_box_medial_volume(model, bounds, device, num_points=20000, seed=0):
+    """Evaluate M on uniform box-interior points without using it for training."""
+    bounds = np.asarray(bounds, dtype=np.float32)
+    queries = np.random.RandomState(seed).uniform(
+        bounds[0], bounds[1], size=(num_points, 3)).astype(np.float32)
+    face_distances = np.concatenate(
+        (queries - bounds[0], bounds[1] - queries), axis=1)
+    target = np.partition(face_distances, 1, axis=1)[:, 1]
+    prediction = predict_medial_queries(model, queries, device)
+    return {
+        'mae': float(np.mean(np.abs(prediction - target))),
+        'under_fraction': float(np.mean(
+            prediction < np.min(face_distances, axis=1))),
+    }
 
 
 def predict_pair_sdf_queries(model, queries, points, evaluation, device, seed,

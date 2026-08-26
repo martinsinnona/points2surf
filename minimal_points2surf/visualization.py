@@ -3,9 +3,24 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import trimesh
-from matplotlib.colors import FuncNorm
+from matplotlib.colors import FuncNorm, TwoSlopeNorm
+from scipy.ndimage import distance_transform_edt
+from skimage.morphology import medial_axis as skimage_medial_axis
 
-from source import sdf
+from source import medial_field, sdf
+
+
+def compute_gt_medial_axis_distance(sdf_slice, pixel_spacing):
+    """Compute a 2D medial axis and its Euclidean distance field in mesh units."""
+    if pixel_spacing <= 0:
+        raise ValueError('pixel_spacing must be positive.')
+    interior = np.asarray(sdf_slice) < 0.0
+    axis = skimage_medial_axis(interior, rng=0)
+    if not np.any(axis):
+        raise ValueError('The SDF slice has no interior medial axis.')
+    distance = distance_transform_edt(
+        ~axis, sampling=(pixel_spacing, pixel_spacing))
+    return axis, distance
 
 
 def _draw_sampling_slice(ax, mesh, points, kinds, volume_padding, slice_z,
@@ -136,9 +151,9 @@ def plot_mse_comparison(histories):
 
 def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
                      slice_zs=(0.0, 0.25), resolution=128,
-                     axis_limit=0.65, isoline_spacing=0.05,
+                     axis_limit=0.58, isoline_spacing=0.05,
                      interior_gamma=2.0):
-    """Compare predicted/GT SDF by row and optionally show interior M at z=0."""
+    """Compare SDF slices and show the derived interior M and Q-MDF fields."""
     if isoline_spacing <= 0:
         raise ValueError('isoline_spacing must be positive.')
     if interior_gamma <= 0:
@@ -147,12 +162,23 @@ def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
         raise ValueError('This comparison expects exactly two slice_zs.')
     axis_values = np.linspace(-axis_limit, axis_limit, resolution, dtype=np.float32)
     xx, yy = np.meshgrid(axis_values, axis_values)
-    fields = []
+    slice_queries = []
     for z in slice_zs:
-        queries = np.column_stack((xx.ravel(), yy.ravel(),
-                                   np.full(xx.size, z, dtype=np.float32)))
-        fields.append((z, predict_sdf(queries).reshape(resolution, resolution),
-                       -sdf.get_signed_distance(mesh, queries).reshape(resolution, resolution)))
+        slice_queries.append(np.column_stack((
+            xx.ravel(), yy.ravel(),
+            np.full(xx.size, z, dtype=np.float32))))
+    all_queries = np.concatenate(slice_queries)
+    predicted_sdf = predict_sdf(all_queries)
+    gt_sdf = -sdf.get_signed_distance(mesh, all_queries)
+    split = resolution * resolution
+    fields = [
+        (z,
+         predicted_sdf[index * split:(index + 1) * split].reshape(
+             resolution, resolution),
+         gt_sdf[index * split:(index + 1) * split].reshape(
+             resolution, resolution))
+        for index, z in enumerate(slice_zs)
+    ]
     all_fields = [field for _, predicted, gt in fields
                   for field in (predicted, gt)]
     negative_limit = max(
@@ -186,15 +212,15 @@ def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
     level_count = int(np.ceil(level_limit / isoline_spacing))
     levels = np.arange(-level_count, level_count + 1) * isoline_spacing
     levels = levels[~np.isclose(levels, 0.0)]
-    column_count = 3 if predict_medial is not None else 2
-    fig = plt.figure(figsize=(10.4 if predict_medial is not None else 7.0, 6.4),
+    column_count = 4 if predict_medial is not None else 2
+    fig = plt.figure(figsize=(16.4 if predict_medial is not None else 8.4, 7.7),
                      constrained_layout=True)
     grid = fig.add_gridspec(2, column_count, wspace=0.04, hspace=0.04)
     axes = np.empty((2, 2), dtype=object)
     sdf_image = None
     for column, (z, predicted, gt) in enumerate(fields):
         for row, (field, row_label) in enumerate(
-                ((predicted, 'Predicted SDF'), (gt, 'GT SDF'))):
+                ((predicted, 'Predicted'), (gt, 'GT'))):
             ax = fig.add_subplot(grid[row, column])
             axes[row, column] = ax
             sdf_image = ax.imshow(
@@ -214,7 +240,7 @@ def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
             for spine in ax.spines.values():
                 spine.set_visible(False)
             if row == 0:
-                ax.set_title(f'z = {z:g}', fontsize=10, pad=10)
+                ax.set_title(f'SDF\nz = {z:g}', fontsize=10, pad=10)
             if column == 0:
                 ax.set_ylabel(row_label, fontsize=10, labelpad=12)
 
@@ -227,35 +253,79 @@ def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
 
     if predict_medial is not None:
         z = slice_zs[0]
-        queries = np.column_stack((xx.ravel(), yy.ravel(),
-                                   np.full(xx.size, z, dtype=np.float32)))
-        medial = predict_medial(queries).reshape(resolution, resolution)
+        medial = predict_medial(slice_queries[0]).reshape(
+            resolution, resolution)
         gt_sdf = fields[0][2]
-        interior_medial = np.ma.masked_where(gt_sdf >= 0.0, medial)
-        visible_medial = medial[gt_sdf < 0.0]
-        medial_limit = max(float(np.percentile(visible_medial, 99.0)), 1e-6)
-        medial_ax = fig.add_subplot(grid[:, 2])
+        interior = gt_sdf < 0.0
+        pixel_spacing = float(axis_values[1] - axis_values[0])
+        _, gt_q_mdf = compute_gt_medial_axis_distance(
+            gt_sdf, pixel_spacing)
+        gt_medial = gt_q_mdf + np.abs(gt_sdf)
+
+        medial_limit = max(
+            float(np.percentile(medial[interior], 99.0)),
+            float(gt_medial[interior].max()), 1e-6)
         medial_cmap = plt.get_cmap('viridis').copy()
         medial_cmap.set_bad('#eeeeee')
-        medial_image = medial_ax.imshow(
-            interior_medial, origin='lower',
-            extent=[axis_values[0], axis_values[-1]] * 2,
-            cmap=medial_cmap, vmin=0.0, vmax=medial_limit)
-        medial_ax.contour(xx, yy, gt_sdf, levels=[0.0], colors='black',
-                          linewidths=1.1)
-        medial_ax.set(aspect='equal')
-        medial_ax.set_title(f'Interior medial field M\nz = {z:g}',
-                            fontsize=10, pad=10)
-        medial_ax.set_xticks([])
-        medial_ax.set_yticks([])
-        for spine in medial_ax.spines.values():
-            spine.set_visible(False)
+        medial_axes = []
+        for row, field in enumerate((medial, gt_medial)):
+            medial_ax = fig.add_subplot(grid[row, 2])
+            medial_axes.append(medial_ax)
+            medial_image = medial_ax.imshow(
+                np.ma.masked_where(~interior, field), origin='lower',
+                extent=[axis_values[0], axis_values[-1]] * 2,
+                cmap=medial_cmap, vmin=0.0, vmax=medial_limit)
+            medial_ax.contour(xx, yy, gt_sdf, levels=[0.0], colors='black',
+                              linewidths=1.1)
+            medial_ax.set(aspect='equal')
+            medial_ax.set_xticks([])
+            medial_ax.set_yticks([])
+            for spine in medial_ax.spines.values():
+                spine.set_visible(False)
+            if row == 0:
+                medial_ax.set_title(
+                    f'Medial field M\nz = {z:g}', fontsize=10, pad=10)
         medial_ticks = np.linspace(0.0, medial_limit, 4)
         medial_bar = fig.colorbar(
-            medial_image, ax=medial_ax, orientation='horizontal',
+            medial_image, ax=medial_axes, orientation='horizontal',
             fraction=0.055, pad=0.06, aspect=16, label='medial radius M')
         medial_bar.set_ticks(
             medial_ticks, labels=[f'{tick:.2f}' for tick in medial_ticks])
+
+        q_mdf = medial_field.medial_level_score(fields[0][1], medial)
+        q_limit = max(
+            float(np.percentile(np.abs(q_mdf[interior]), 99.0)),
+            float(gt_q_mdf[interior].max()), 1e-6)
+        q_cmap = plt.get_cmap('coolwarm').copy()
+        q_cmap.set_bad('#eeeeee')
+        q_axes = []
+        for row, field in enumerate((q_mdf, gt_q_mdf)):
+            q_ax = fig.add_subplot(grid[row, 3])
+            q_axes.append(q_ax)
+            q_image = q_ax.imshow(
+                np.ma.masked_where(~interior, field), origin='lower',
+                extent=[axis_values[0], axis_values[-1]] * 2,
+                cmap=q_cmap,
+                norm=TwoSlopeNorm(vmin=-q_limit, vcenter=0.0, vmax=q_limit))
+            q_ax.contour(xx, yy, gt_sdf, levels=[0.0], colors='black',
+                         linewidths=1.1)
+            q_ax.set(aspect='equal')
+            q_ax.set_xticks([])
+            q_ax.set_yticks([])
+            for spine in q_ax.spines.values():
+                spine.set_visible(False)
+            if row == 0:
+                if q_mdf[interior].min() < 0.0 < q_mdf[interior].max():
+                    q_ax.contour(xx, yy, q_mdf, levels=[0.0], colors='black',
+                                 linewidths=1.1)
+                q_ax.set_title(
+                    f'Q-MDF\nz = {z:g}', fontsize=10, pad=10)
+        q_bar = fig.colorbar(
+            q_image, ax=q_axes, orientation='horizontal',
+            fraction=0.055, pad=0.06, aspect=16, label='Q-MDF distance')
+        q_bar.set_ticks(
+            [-q_limit, 0.0, q_limit],
+            labels=[f'{-q_limit:.2f}', '0.00', f'{q_limit:.2f}'])
     return fig
 
 
