@@ -88,6 +88,30 @@ def plot_medial_training_history(history):
     return fig
 
 
+def plot_medial_ablation(results):
+    """Compare leave-one-change-out medial-field ablations."""
+    labels = [result['name'] for result in results]
+    positions = np.arange(len(labels))
+    fig, (mae_ax, orthogonal_ax) = plt.subplots(
+        1, 2, figsize=(11.5, 4.4), sharey=True)
+    mae = [result['medial_mae'] for result in results]
+    orthogonality = [result['orthogonality'] for result in results]
+    colors = ['tab:blue'] * (len(results) - 1) + ['tab:green']
+    mae_ax.barh(positions, mae, color=colors)
+    orthogonal_ax.barh(positions, orthogonality, color=colors)
+    mae_ax.set_yticks(positions, labels)
+    mae_ax.invert_yaxis()
+    mae_ax.set(xlabel='GT-axis radius MAE', title='Medial-field accuracy')
+    orthogonal_ax.set(xlabel='final raw loss', title='Orthogonality')
+    for ax, values in ((mae_ax, mae), (orthogonal_ax, orthogonality)):
+        ax.grid(axis='x', alpha=0.25)
+        for position, value in zip(positions, values):
+            ax.text(value, position, f' {value:.4f}', va='center', fontsize=9)
+    fig.suptitle('Leave-one-change-out ablation (lower is better)', fontsize=11)
+    fig.tight_layout(pad=1.5, w_pad=3.0)
+    return fig
+
+
 def plot_mse_comparison(histories):
     """Compare uniform-volume and medial-axis SDF MSE across experiments."""
     fig, (volume_ax, medial_ax) = plt.subplots(1, 2, figsize=(11.5, 4.0),

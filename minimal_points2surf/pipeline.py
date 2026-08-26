@@ -36,6 +36,15 @@ class EvaluationData:
     secondary_global_sample: np.ndarray | None = None
 
 
+@dataclass
+class SDFGrid:
+    """Differentiable regular-grid cache of the frozen learned SDF."""
+
+    values: torch.Tensor
+    lower: torch.Tensor
+    upper: torch.Tensor
+
+
 def seed_everything(seed):
     """Seed the random generators used by this small experiment."""
     random.seed(seed)
@@ -167,13 +176,14 @@ def make_medial_optimizer(model, learning_rate):
     return torch.optim.Adam(model.medial_head.parameters(), lr=learning_rate)
 
 
-def add_query_medial_head(model, hidden_size=64):
+def add_query_medial_head(model, hidden_size=64, smooth=True):
     """Attach a small interior medial-field head M(x) that sees only query xyz."""
+    activation = lambda: nn.Softplus(beta=100) if smooth else nn.ReLU()
     head = nn.Sequential(
         nn.Linear(3, hidden_size),
-        nn.ReLU(),
+        activation(),
         nn.Linear(hidden_size, hidden_size),
-        nn.ReLU(),
+        activation(),
         nn.Linear(hidden_size, 1),
     )
     nn.init.constant_(head[-1].bias, -1.25)
@@ -398,6 +408,38 @@ def predict_sdf_queries(model, queries, points, evaluation, device, seed,
     return np.concatenate(predictions)
 
 
+def make_sdf_grid(model, points, evaluation, bounds, device, seed,
+                  resolution=25, points_per_patch=300, batch_size=64):
+    """Evaluate the frozen Points2Surf SDF once on a regular 3D grid."""
+    bounds = np.asarray(bounds, dtype=np.float32)
+    axes = [np.linspace(bounds[0, axis], bounds[1, axis], resolution,
+                        dtype=np.float32) for axis in range(3)]
+    grid_z, grid_y, grid_x = np.meshgrid(
+        axes[2], axes[1], axes[0], indexing='ij')
+    queries = np.stack(
+        (grid_x.ravel(), grid_y.ravel(), grid_z.ravel()), axis=1)
+    values = predict_sdf_queries(
+        model, queries, points, evaluation, device, seed,
+        points_per_patch=points_per_patch, batch_size=batch_size,
+        query_conditioned_global=False)
+    return SDFGrid(
+        values=torch.from_numpy(values.reshape(
+            resolution, resolution, resolution)).to(device)[None, None],
+        lower=torch.from_numpy(bounds[0]).to(device),
+        upper=torch.from_numpy(bounds[1]).to(device),
+    )
+
+
+def sample_sdf_grid(sdf_grid, queries):
+    """Trilinearly sample cached SDF values at differentiable xyz queries."""
+    coordinates = 2.0 * (
+        queries - sdf_grid.lower) / (sdf_grid.upper - sdf_grid.lower) - 1.0
+    coordinates = coordinates.reshape(1, 1, 1, -1, 3)
+    return F.grid_sample(
+        sdf_grid.values, coordinates, mode='bilinear',
+        padding_mode='border', align_corners=True).reshape(-1)
+
+
 def predict_medial_queries(model, queries, device, batch_size=4096):
     """Evaluate the query-only interior medial head on arbitrary xyz points."""
     queries = np.asarray(queries, dtype=np.float32)
@@ -409,6 +451,16 @@ def predict_medial_queries(model, queries, device, batch_size=4096):
                 queries[start:start + batch_size]).to(device)
             predictions.append(predict_medial(model, batch_queries).cpu().numpy())
     return np.concatenate(predictions)
+
+
+def evaluate_box_medial_head(model, bounds, device, grid_resolution=33,
+                             max_points=4096, seed=0):
+    """Measure M radius error on evaluation-only box medial-axis samples."""
+    axis_points, axis_radii = medial_field.approximate_box_medial_axis_from_bounds(
+        bounds, grid_resolution=grid_resolution, max_points=max_points,
+        seed=seed)
+    prediction = predict_medial_queries(model, axis_points, device)
+    return medial_field.medial_axis_field_metrics(prediction, axis_radii)
 
 
 def predict_pair_sdf_queries(model, queries, points, evaluation, device, seed,
@@ -567,7 +619,7 @@ def calc_eikonal_loss(model, batch):
 
 
 def _batch_at_queries(batch, queries):
-    """Recenter the current local patches at new differentiable queries."""
+    """Recenter the current local patches at differentiable queries."""
     old_queries = batch['imp_surf_query_point_ms']
     radii = batch['patch_radius_ms'].reshape(-1, 1, 1)
     patch_points = batch['patch_pts_ps'] * radii + old_queries.unsqueeze(1)
@@ -579,25 +631,20 @@ def _batch_at_queries(batch, queries):
 
 def _batch_at_new_neighborhoods(batch, queries, points, prediction_tree,
                                 points_per_patch):
-    """Build kNN patches at new queries, with fixed neighbors and live centers."""
+    """Build local patches at projected centers for the uncached ablation."""
     query_array = queries.detach().cpu().numpy()
     _, point_ids = prediction_tree.query(query_array, k=points_per_patch)
     point_ids = np.asarray(point_ids, dtype=np.int64)
     if point_ids.ndim == 1:
         point_ids = point_ids[None, :]
-
     patch_points = np.asarray(points, dtype=np.float32)[point_ids]
     radii = np.asarray([
         utils.get_patch_radii(patch, query)
         for patch, query in zip(patch_points, query_array)
     ], dtype=np.float32)
-    if np.any(radii <= 0.0):
-        raise ValueError('A projected-center patch has zero radius.')
-
     patch_points = torch.as_tensor(
         patch_points, device=queries.device, dtype=queries.dtype)
-    radii = torch.as_tensor(
-        radii, device=queries.device, dtype=queries.dtype)
+    radii = torch.as_tensor(radii, device=queries.device, dtype=queries.dtype)
     moved = batch.copy()
     moved['patch_pts_ps'] = (
         patch_points - queries.unsqueeze(1)) / radii[:, None, None]
@@ -608,19 +655,15 @@ def _batch_at_new_neighborhoods(batch, queries, points, prediction_tree,
 
 
 def _signed_sdf_from_batch(model, batch):
-    """Convert the model's magnitude/sign outputs to mesh-space signed SDF."""
+    """Convert Points2Surf outputs to a signed distance in mesh units."""
     output = model(batch)
-    signed_patch_distance = output[:, 0].abs() * torch.tanh(output[:, 1])
-    return signed_patch_distance * batch['patch_radius_ms'].reshape(-1)
+    signed_distance = output[:, 0].abs() * torch.tanh(output[:, 1])
+    return signed_distance * batch['patch_radius_ms'].reshape(-1)
 
 
-def _predict_signed_sdf(model, batch, queries):
-    """Evaluate the current SDF model at differentiable mesh-space queries."""
-    return _signed_sdf_from_batch(model, _batch_at_queries(batch, queries))
-
-
-def calc_medial_losses(model, batch, weights, points, prediction_tree,
-                       points_per_patch=300):
+def calc_medial_losses(model, batch, weights, sdf_grid=None,
+                       normalize_sdf_gradient=True, points=None,
+                       prediction_tree=None, points_per_patch=300):
     """Deep Medial Fields losses for the query-only interior M head."""
     # The existing SDF sign target only selects interior samples; M has no target.
     inside = batch['imp_surf_dist_sign_ms'].reshape(-1) < 0.5
@@ -635,7 +678,13 @@ def calc_medial_losses(model, batch, weights, points, prediction_tree,
         for name, value in batch.items()
     }
     queries = interior_batch['imp_surf_query_point_ms'].detach().requires_grad_(True)
-    phi = _predict_signed_sdf(model, interior_batch, queries)
+    if sdf_grid is None:
+        if points is None or prediction_tree is None:
+            raise ValueError('Uncached SDF sampling requires points and prediction_tree.')
+        phi = _signed_sdf_from_batch(
+            model, _batch_at_queries(interior_batch, queries))
+    else:
+        phi = sample_sdf_grid(sdf_grid, queries)
     phi_grad = torch.autograd.grad(phi.sum(), queries)[0].detach()
     phi = phi.detach()
     medial = predict_medial(model, queries)
@@ -644,17 +693,24 @@ def calc_medial_losses(model, batch, weights, points, prediction_tree,
 
     maximality = torch.mean(F.relu(torch.abs(phi) - medial) ** 2)
 
-    unsigned_grad = torch.sign(phi).unsqueeze(-1) * phi_grad
-    unsigned_grad = unsigned_grad / torch.linalg.vector_norm(
-        unsigned_grad, dim=1, keepdim=True).clamp(min=1e-8)
+    sdf_normal = phi_grad
+    if normalize_sdf_gradient:
+        sdf_normal = sdf_normal / torch.linalg.vector_norm(
+            sdf_normal, dim=1, keepdim=True).clamp(min=1e-8)
+    projection_normal = phi_grad / torch.linalg.vector_norm(
+        phi_grad, dim=1, keepdim=True).clamp(min=1e-8)
+    unsigned_grad = torch.sign(phi).unsqueeze(-1) * projection_normal
     centers = queries + unsigned_grad * (medial - torch.abs(phi)).unsqueeze(-1)
-    center_batch = _batch_at_new_neighborhoods(
-        interior_batch, centers, points, prediction_tree, points_per_patch)
-    center_phi = _signed_sdf_from_batch(model, center_batch)
+    if sdf_grid is None:
+        center_batch = _batch_at_new_neighborhoods(
+            interior_batch, centers, points, prediction_tree, points_per_patch)
+        center_phi = _signed_sdf_from_batch(model, center_batch)
+    else:
+        center_phi = sample_sdf_grid(sdf_grid, centers)
     inscription = torch.mean((torch.abs(center_phi) - medial) ** 2)
 
     orthogonality = torch.mean(
-        torch.sum(medial_grad * phi_grad, dim=1) ** 2)
+        torch.sum(medial_grad * sdf_normal, dim=1) ** 2)
     losses = {
         'maximality': maximality,
         'inscription': inscription,
@@ -664,20 +720,22 @@ def calc_medial_losses(model, batch, weights, points, prediction_tree,
     return total, losses
 
 
-def train_medial_model(model, optimizer, loader, points, prediction_tree,
-                       device, epochs, weights, points_per_patch=300):
+def train_medial_model(model, optimizer, loader, sdf_grid,
+                       device, epochs, weights, normalize_sdf_gradient=True,
+                       points=None, prediction_tree=None, points_per_patch=300,
+                       description='training medial field'):
     """Train only the query-based medial head against the frozen SDF."""
     history = {name: [] for name in (
         'medial_total', 'maximality', 'inscription', 'orthogonality')}
-    progress = tqdm(range(epochs), desc='training medial field')
+    progress = tqdm(range(epochs), desc=description)
     model.eval()
     for _ in progress:
         losses = {name: [] for name in history}
         for batch in loader:
             batch = {name: value.to(device) for name, value in batch.items()}
             total, terms = calc_medial_losses(
-                model, batch, weights, points, prediction_tree,
-                points_per_patch)
+                model, batch, weights, sdf_grid, normalize_sdf_gradient,
+                points, prediction_tree, points_per_patch)
             optimizer.zero_grad()
             total.backward()
             optimizer.step()
@@ -700,7 +758,7 @@ def train_model(model, optimizer, loader, dataset, dataset_dir,
                 lr_decay_epoch=None, eikonal_weight=0.0, restore_best=False,
                 direct_magnitude_loss=False, query_conditioned_global=False,
                 select_best_by_mae=False, fixed_global_context=False,
-                medial_weights=None):
+                medial_weights=None, medial_sdf_grid=None):
     """Train with tqdm and optional ridge-band samples, returning history and data state."""
 
     loss_names = ['total', 'signed', 'magnitude', 'sign']
@@ -753,9 +811,10 @@ def train_model(model, optimizer, loader, dataset, dataset_dir,
                 eikonal_loss = calc_eikonal_loss(model, batch)
                 loss = loss + eikonal_weight * eikonal_loss
             if medial_weights is not None:
+                if medial_sdf_grid is None:
+                    raise ValueError('medial_sdf_grid is required for medial losses.')
                 medial_total, medial_losses = calc_medial_losses(
-                    model, batch, medial_weights, points,
-                    evaluation.prediction_tree, points_per_patch)
+                    model, batch, medial_weights, medial_sdf_grid)
                 loss = loss + medial_total
             optimizer.zero_grad()
             loss.backward()
