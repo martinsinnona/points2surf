@@ -192,9 +192,13 @@ def make_medial_optimizer(model, learning_rate):
     return torch.optim.Adam(model.medial_head.parameters(), lr=learning_rate)
 
 
-def add_query_medial_head(model, hidden_size=64, hidden_layers=2, smooth=True):
+def add_query_medial_head(model, hidden_size=64, hidden_layers=2, smooth=True,
+                          softplus_beta=100.0):
     """Attach a small interior medial-field head M(x) that sees only query xyz."""
-    activation = lambda: nn.Softplus(beta=100) if smooth else nn.ReLU()
+    if softplus_beta <= 0.0:
+        raise ValueError('softplus_beta must be positive.')
+    activation = lambda: (nn.Softplus(beta=softplus_beta)
+                          if smooth else nn.ReLU())
     layers = [nn.Linear(3, hidden_size), activation()]
     for _ in range(hidden_layers - 1):
         layers.extend((nn.Linear(hidden_size, hidden_size), activation()))
@@ -506,6 +510,16 @@ def predict_medial_queries(model, queries, device, batch_size=4096):
     return np.concatenate(predictions)
 
 
+def evaluate_medial_queries(model, queries, target, device):
+    """Evaluate predicted M against an evaluation-only medial-field target."""
+    prediction = predict_medial_queries(model, queries, device)
+    target = np.asarray(target, dtype=np.float32)
+    return {
+        'mse': float(np.mean((prediction - target) ** 2)),
+        'mae': float(np.mean(np.abs(prediction - target))),
+    }
+
+
 def evaluate_box_medial_head(model, bounds, device, grid_resolution=33,
                              max_points=4096, seed=0):
     """Measure M radius error on evaluation-only box medial-axis samples."""
@@ -792,14 +806,27 @@ def calc_medial_losses(model, batch, weights, sdf_grid=None,
 def train_medial_model(model, optimizer, loader, sdf_grid,
                        device, epochs, weights, normalize_sdf_gradient=True,
                        points=None, prediction_tree=None, points_per_patch=300,
-                       description='training medial field'):
+                       description='training medial field',
+                       q_mdf_evaluation=None, lr_decay_epoch=None,
+                       lr_decay_factor=0.2):
     """Train only the query-based medial head against the frozen SDF."""
-    history = {name: [] for name in (
-        'medial_total', 'maximality', 'inscription', 'orthogonality')}
+    training_names = (
+        'medial_total', 'maximality', 'inscription', 'orthogonality')
+    history = {name: [] for name in (*training_names, 'q_mdf_mse')}
+    q_eval = None
+    if q_mdf_evaluation is not None:
+        q_queries, q_target = q_mdf_evaluation
+        with torch.no_grad():
+            q_queries = torch.as_tensor(
+                q_queries, device=device, dtype=sdf_grid.values.dtype)
+            q_target = torch.as_tensor(
+                q_target, device=device, dtype=sdf_grid.values.dtype)
+            q_abs_sdf = torch.abs(sample_sdf_grid(sdf_grid, q_queries))
+        q_eval = q_queries, q_target, q_abs_sdf
     progress = tqdm(range(epochs), desc=description)
     model.eval()
-    for _ in progress:
-        losses = {name: [] for name in history}
+    for epoch in progress:
+        losses = {name: [] for name in training_names}
         for batch in loader:
             batch = {name: value.to(device) for name, value in batch.items()}
             total, terms = calc_medial_losses(
@@ -811,10 +838,22 @@ def train_medial_model(model, optimizer, loader, sdf_grid,
             losses['medial_total'].append(total.item())
             for name, value in terms.items():
                 losses[name].append(value.item())
-        for name in history:
+        for name in training_names:
             history[name].append(float(np.mean(losses[name])))
+        if q_eval is None:
+            history['q_mdf_mse'].append(np.nan)
+        else:
+            q_queries, q_target, q_abs_sdf = q_eval
+            with torch.no_grad():
+                q_prediction = predict_medial(model, q_queries) - q_abs_sdf
+                history['q_mdf_mse'].append(float(
+                    F.mse_loss(q_prediction, q_target).item()))
+        if lr_decay_epoch is not None and epoch + 1 == lr_decay_epoch:
+            for parameter_group in optimizer.param_groups:
+                parameter_group['lr'] *= lr_decay_factor
         progress.set_postfix(
             medial=f"{history['medial_total'][-1]:.5f}",
+            q_mdf_mse=f"{history['q_mdf_mse'][-1]:.5f}",
             lr=optimizer.param_groups[0]['lr'])
     return history
 

@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import trimesh
 from matplotlib.colors import FuncNorm, TwoSlopeNorm
+from matplotlib.ticker import LogFormatterSciNotation, LogLocator
 from scipy.ndimage import distance_transform_edt
 from skimage.morphology import medial_axis as skimage_medial_axis
 
@@ -21,6 +22,30 @@ def compute_gt_medial_axis_distance(sdf_slice, pixel_spacing):
     distance = distance_transform_edt(
         ~axis, sampling=(pixel_spacing, pixel_spacing))
     return axis, distance
+
+
+def make_q_mdf_slice_evaluation(mesh, slice_z=0.0, resolution=64,
+                                axis_limit=0.58,
+                                include_medial_target=False):
+    """Make fixed interior queries and GT axis distances for Q-MDF evaluation."""
+    axis_values = np.linspace(
+        -axis_limit, axis_limit, resolution, dtype=np.float32)
+    xx, yy = np.meshgrid(axis_values, axis_values)
+    queries = np.column_stack((
+        xx.ravel(), yy.ravel(),
+        np.full(xx.size, slice_z, dtype=np.float32)))
+    gt_sdf = -sdf.get_signed_distance(mesh, queries).reshape(
+        resolution, resolution)
+    _, gt_q_mdf = compute_gt_medial_axis_distance(
+        gt_sdf, float(axis_values[1] - axis_values[0]))
+    interior = gt_sdf < 0.0
+    interior_queries = queries[interior.ravel()]
+    q_target = gt_q_mdf[interior].astype(np.float32)
+    if include_medial_target:
+        medial_target = (q_target + np.abs(gt_sdf[interior])).astype(
+            np.float32)
+        return interior_queries, q_target, medial_target
+    return interior_queries, q_target
 
 
 def _draw_sampling_slice(ax, mesh, points, kinds, volume_padding, slice_z,
@@ -73,8 +98,12 @@ def plot_training_history(history):
     evaluated = np.isfinite(history['eval_mse'])
     mse_ax.plot(epochs[evaluated], np.asarray(history['eval_mse'])[evaluated],
                 marker='o', color='tab:purple', label='uniform volume')
-    mse_ax.plot(epochs[evaluated], np.asarray(history['eval_medial_mse'])[evaluated],
-                marker='o', color='tab:green', label='GT medial axis')
+    medial_evaluated = np.isfinite(history['eval_medial_mse'])
+    if np.any(medial_evaluated):
+        mse_ax.plot(
+            epochs[medial_evaluated],
+            np.asarray(history['eval_medial_mse'])[medial_evaluated],
+            marker='o', color='tab:green', label='medial axis')
     mse_ax.set(xlabel='epoch', ylabel='MSE (log)', yscale='log')
     mse_ax.set_title('SDF MSE', fontsize=10, pad=12)
     mse_ax.grid(alpha=0.25)
@@ -88,8 +117,8 @@ def plot_training_history(history):
 
 
 def plot_medial_training_history(history):
-    """Plot the three raw DMF losses and their weighted sum separately."""
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    """Plot the DMF training losses and evaluation-only Q-MDF MSE."""
+    fig, (ax, q_ax) = plt.subplots(1, 2, figsize=(11.5, 4.2))
     epochs = np.arange(1, len(history['medial_total']) + 1)
     for name in ('maximality', 'inscription', 'orthogonality'):
         ax.plot(epochs, history[name], label=name)
@@ -99,7 +128,21 @@ def plot_medial_training_history(history):
     ax.set_title('Interior medial-field losses', fontsize=10, pad=12)
     ax.grid(alpha=0.25)
     ax.legend()
-    fig.tight_layout(pad=1.5)
+    q_mdf_mse = np.asarray(
+        history.get('q_mdf_mse', np.full(len(epochs), np.nan)))
+    evaluated = np.isfinite(q_mdf_mse)
+    q_ax.plot(epochs[evaluated], q_mdf_mse[evaluated], color='tab:purple')
+    q_ax.set(xlabel='epoch', ylabel='MSE (log)', yscale='log')
+    positive_values = q_mdf_mse[evaluated & (q_mdf_mse > 0.0)]
+    if len(positive_values):
+        q_ax.yaxis.set_major_locator(
+            LogLocator(base=10.0, subs=np.arange(1.0, 10.0, 0.5)))
+        q_ax.yaxis.set_major_formatter(LogFormatterSciNotation(
+            base=10.0, labelOnlyBase=False,
+            minor_thresholds=(np.inf, np.inf)))
+    q_ax.set_title('Q-MDF MSE (evaluation only)', fontsize=10, pad=12)
+    q_ax.grid(alpha=0.25)
+    fig.tight_layout(pad=1.5, w_pad=3.0)
     return fig
 
 
@@ -152,12 +195,15 @@ def plot_mse_comparison(histories):
 def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
                      slice_zs=(0.0, 0.25), resolution=128,
                      axis_limit=0.58, isoline_spacing=0.05,
-                     interior_gamma=2.0):
+                     interior_gamma=2.0, q_mdf_epsilon=0.01,
+                     q_mdf_use_gt_sdf=False):
     """Compare SDF slices and show the derived interior M and Q-MDF fields."""
     if isoline_spacing <= 0:
         raise ValueError('isoline_spacing must be positive.')
     if interior_gamma <= 0:
         raise ValueError('interior_gamma must be positive.')
+    if q_mdf_epsilon <= 0:
+        raise ValueError('q_mdf_epsilon must be positive.')
     if len(slice_zs) != 2:
         raise ValueError('This comparison expects exactly two slice_zs.')
     axis_values = np.linspace(-axis_limit, axis_limit, resolution, dtype=np.float32)
@@ -292,7 +338,8 @@ def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
         medial_bar.set_ticks(
             medial_ticks, labels=[f'{tick:.2f}' for tick in medial_ticks])
 
-        q_mdf = medial_field.medial_level_score(fields[0][1], medial)
+        q_sdf = gt_sdf if q_mdf_use_gt_sdf else fields[0][1]
+        q_mdf = medial_field.medial_level_score(q_sdf, medial)
         q_limit = max(
             float(np.percentile(np.abs(q_mdf[interior]), 99.0)),
             float(gt_q_mdf[interior].max()), 1e-6)
@@ -309,6 +356,12 @@ def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
                 norm=TwoSlopeNorm(vmin=-q_limit, vcenter=0.0, vmax=q_limit))
             q_ax.contour(xx, yy, gt_sdf, levels=[0.0], colors='black',
                          linewidths=1.1)
+            visible_field = field[interior]
+            if visible_field.min() < q_mdf_epsilon < visible_field.max():
+                q_ax.contour(
+                    xx, yy, np.ma.masked_where(~interior, field),
+                    levels=[q_mdf_epsilon], colors='black',
+                    linewidths=1.4, linestyles='solid')
             q_ax.set(aspect='equal')
             q_ax.set_xticks([])
             q_ax.set_yticks([])
@@ -318,8 +371,11 @@ def plot_sdf_slices(mesh, predict_sdf, predict_medial=None,
                 if q_mdf[interior].min() < 0.0 < q_mdf[interior].max():
                     q_ax.contour(xx, yy, q_mdf, levels=[0.0], colors='black',
                                  linewidths=1.1)
+                q_title = ('Q-MDF (pred M + GT SDF)'
+                           if q_mdf_use_gt_sdf else 'Q-MDF')
                 q_ax.set_title(
-                    f'Q-MDF\nz = {z:g}', fontsize=10, pad=10)
+                    f'{q_title}\nz = {z:g}, ε = {q_mdf_epsilon:g}',
+                    fontsize=10, pad=10)
         q_bar = fig.colorbar(
             q_image, ax=q_axes, orientation='horizontal',
             fraction=0.055, pad=0.06, aspect=16, label='Q-MDF distance')
