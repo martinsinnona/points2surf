@@ -448,6 +448,24 @@ def make_sdf_grid(model, points, evaluation, bounds, device, seed,
     )
 
 
+def make_gt_sdf_grid(mesh, bounds, device, resolution=25):
+    """Evaluate the mesh SDF once on a regular 3D grid."""
+    bounds = np.asarray(bounds, dtype=np.float32)
+    axes = [np.linspace(bounds[0, axis], bounds[1, axis], resolution,
+                        dtype=np.float32) for axis in range(3)]
+    grid_z, grid_y, grid_x = np.meshgrid(
+        axes[2], axes[1], axes[0], indexing='ij')
+    queries = np.stack(
+        (grid_x.ravel(), grid_y.ravel(), grid_z.ravel()), axis=1)
+    values = -sdf.get_signed_distance(mesh, queries).astype(np.float32)
+    return SDFGrid(
+        values=torch.from_numpy(values.reshape(
+            resolution, resolution, resolution)).to(device)[None, None],
+        lower=torch.from_numpy(bounds[0]).to(device),
+        upper=torch.from_numpy(bounds[1]).to(device),
+    )
+
+
 def sample_sdf_grid(sdf_grid, queries):
     """Trilinearly sample cached SDF values at differentiable xyz queries."""
     coordinates = 2.0 * (
